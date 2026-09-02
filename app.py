@@ -4,128 +4,195 @@ import pandas as pd
 import numpy as np
 from scipy.signal import argrelextrema
 import yfinance as yf
-from datetime import datetime, timedelta
+import pytz
 
-st.set_page_config(layout="wide", page_title="S&R Master Challenge")
+st.set_page_config(layout="wide", page_title="S&R Paper Trading Sim")
 
-# --- GAME STYLING ---
-st.title("🎮 S&R Challenge: Intraday Edition")
+# ==========================================
+# 1. INITIALIZE SESSION STATE (APP MEMORY)
+# ==========================================
+if "sim_active" not in st.session_state:
+    st.session_state.sim_active = False
+if "balance" not in st.session_state:
+    st.session_state.balance = 1000.00
+if "shares" not in st.session_state:
+    st.session_state.shares = 0.0
+if "step" not in st.session_state:
+    st.session_state.step = 0
+if "df" not in st.session_state:
+    st.session_state.df = pd.DataFrame()
+if "trade_log" not in st.session_state:
+    st.session_state.trade_log = []
 
-# --- SIDEBAR / GAME CONTROLS ---
-st.sidebar.header("🕹️ Game Setup")
-ticker = st.sidebar.text_input("Stock Ticker", value="SPY").upper()
-
-timeframe = st.sidebar.selectbox("Timeframe (Candle Size)", ["1m", "5m", "15m", "1h", "1d"], index=0)
-
-# Dynamic Windowing: Allow user to look at very short periods
-if timeframe in ["1m", "5m"]:
-    window_type = st.sidebar.radio("View Window", ["Last few Hours", "Full Day"])
-    if window_type == "Last few Hours":
-        hours_to_show = st.sidebar.slider("Hours to look back", 1, 8, 2)
-        days_to_fetch = 1
+# ==========================================
+# 2. DATA FETCHING HELPER
+# ==========================================
+@st.cache_data(ttl=3600)
+def fetch_1m_data(ticker):
+    # Fetch last 7 days of 1m data
+    data = yf.download(ticker, period="7d", interval="1m", auto_adjust=True, progress=False)
+    if data.empty: return None
+    
+    if isinstance(data.columns, pd.MultiIndex): 
+        data.columns = data.columns.get_level_values(0)
+    
+    df = data.reset_index()
+    df.columns = [str(col).lower() for col in df.columns]
+    df.rename(columns={df.columns[0]: "timestamp"}, inplace=True)
+    
+    # Convert to US/Eastern timezone to read market hours easily
+    if df['timestamp'].dt.tz is None:
+        df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert('US/Eastern')
     else:
-        hours_to_show = None
-        days_to_fetch = st.sidebar.slider("Days to fetch", 1, 7, 1)
-else:
-    hours_to_show = None
-    days_to_fetch = st.sidebar.slider("Days to look back", 5, 365, 30)
+        df['timestamp'] = df['timestamp'].dt.tz_convert('US/Eastern')
+        
+    # Filter for standard market hours (09:30 to 16:00) to remove blanks
+    df = df.set_index("timestamp").between_time("09:30", "15:59").reset_index()
+    
+    # Create a clean label
+    df["label"] = df["timestamp"].dt.strftime("%H:%M")
+    df["date_only"] = df["timestamp"].dt.date
+    return df
+
+# ==========================================
+# 3. SIDEBAR: SIMULATOR SETUP
+# ==========================================
+st.sidebar.header("⚙️ 1. Setup Simulation")
+ticker = st.sidebar.text_input("Ticker", value="SPY").upper()
+
+raw_df = fetch_1m_data(ticker)
+
+if raw_df is not None and not raw_df.empty:
+    # Get available dates
+    available_dates = raw_df["date_only"].unique()
+    selected_date = st.sidebar.selectbox("Select Day to Trade", available_dates)
+    
+    # Filter data to just that day
+    day_df = raw_df[raw_df["date_only"] == selected_date].reset_index(drop=True)
+    
+    # Select Start Time
+    times = day_df["label"].tolist()
+    start_time = st.sidebar.selectbox("Start Time", times, index=min(90, len(times)-1)) # Defaults to ~11:00 AM
+
+    if st.sidebar.button("🚀 Start / Reset Simulation"):
+        st.session_state.df = day_df
+        # Find the index of the start time
+        st.session_state.step = day_df[day_df["label"] == start_time].index[0]
+        st.session_state.balance = 1000.00
+        st.session_state.shares = 0.0
+        st.session_state.trade_log = []
+        st.session_state.sim_active = True
+        st.rerun()
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🎯 Submit Your Guesses")
-user_input = st.sidebar.text_input("Enter prices (e.g. 450.2, 451.0)", placeholder="0.0, 0.0")
-submit_button = st.sidebar.button("🏆 Grade My Guesses")
+show_bot_lines = st.sidebar.checkbox("Show Bot S&R Lines", value=False)
+order = st.sidebar.slider("Bot Sensitivity", 5, 50, 20)
 
-# Bot Sensitivity (Higher order = ignores noise)
-order = st.sidebar.slider("Bot Sensitivity (Noise Filter)", 5, 100, 30)
+# ==========================================
+# 4. MAIN TRADING DASHBOARD
+# ==========================================
+st.title("💹 Market Replay Simulator")
 
-# --- DATA FETCHING ---
-@st.cache_data(ttl=60) # Short cache for intraday
-def fetch_data(symbol, period_days, interval, hours):
-    try:
-        data = yf.download(symbol, period=f"{period_days}d", interval=interval, auto_adjust=True, progress=False)
-        if data.empty: return None
-        
-        if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.get_level_values(0)
-        df = data.reset_index()
-        df.columns = [str(col).lower() for col in df.columns]
-        df.rename(columns={df.columns[0]: "timestamp"}, inplace=True)
-        df = df.dropna().drop_duplicates(subset="timestamp")
+if st.session_state.sim_active:
+    # --- GET CURRENT DATA STATE ---
+    current_step = st.session_state.step
+    df_sim = st.session_state.df.iloc[:current_step+1]
+    current_price = df_sim.iloc[-1]["close"]
+    current_time = df_sim.iloc[-1]["label"]
 
-        # --- THE ZOOM LOGIC ---
-        if hours:
-            cutoff = df["timestamp"].max() - pd.Timedelta(hours=hours)
-            df = df[df["timestamp"] > cutoff]
-        
-        return df.reset_index(drop=True)
-    except Exception as e:
-        st.error(f"Error fetching data: {e}")
-        return None
+    # --- CALCULATE PORTFOLIO ---
+    position_value = st.session_state.shares * current_price
+    total_equity = st.session_state.balance + position_value
+    pnl = total_equity - 1000.00
+    pnl_color = "normal" if pnl == 0 else ("inverse" if pnl > 0 else "off")
 
-df = fetch_data(ticker, days_to_fetch, timeframe, hours_to_show)
-
-if df is not None and not df.empty:
-    # Gap Fix labels
-    label_fmt = "%H:%M" if timeframe in ["1m", "5m"] else "%b %d %H:%M"
-    df["label"] = df["timestamp"].dt.strftime(label_fmt)
-
-    # --- BOT LOGIC (Noise Filtered) ---
-    # Using 'order' to ensure a peak is higher than 'order' number of candles around it
-    support_idx = argrelextrema(df["low"].values, np.less_equal, order=order)[0]
-    resistance_idx = argrelextrema(df["high"].values, np.greater_equal, order=order)[0]
-
-    bot_supports = sorted(list(set(df.iloc[support_idx]["low"].round(2))))
-    bot_resistances = sorted(list(set(df.iloc[resistance_idx]["high"].round(2))))
-    all_bot_levels = bot_supports + bot_resistances
-
-    # --- GRADING ENGINE ---
-    if submit_button and user_input:
-        try:
-            user_guesses = [float(x.strip()) for x in user_input.split(",")]
-            score = 0
-            feedback = []
-            
-            # Use a tighter tolerance for 1m charts (0.1% instead of 0.5%)
-            tolerance = 0.001 if timeframe == "1m" else 0.003
-
-            for guess in user_guesses:
-                found_match = False
-                for bot_level in all_bot_levels:
-                    if abs(guess - bot_level) / bot_level <= tolerance:
-                        found_match = True
-                        break
-                if found_match:
-                    score += 1
-                    feedback.append(f"✅ **{guess}** is a HIT!")
-                else:
-                    feedback.append(f"❌ **{guess}** is a MISS.")
-            
-            st.sidebar.success(f"Score: {score} / {len(user_guesses)}")
-            for f in feedback: st.sidebar.write(f)
-        except:
-            st.sidebar.error("Enter valid numbers.")
+    # --- TOP METRICS ROW ---
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Current Price", f"${current_price:.2f}")
+    col2.metric("Total Equity", f"${total_equity:.2f}", f"${pnl:.2f}", delta_color=pnl_color)
+    col3.metric("Cash Available", f"${st.session_state.balance:.2f}")
+    col4.metric("Open Position", f"{st.session_state.shares:.4f} shares", f"${position_value:.2f}")
 
     # --- CHARTING ---
     fig = go.Figure(data=[go.Candlestick(
-        x=df["label"], open=df["open"], high=df["high"],
-        low=df["low"], close=df["close"], name=ticker
+        x=df_sim["label"], open=df_sim["open"], high=df_sim["high"],
+        low=df_sim["low"], close=df_sim["close"], name=ticker
     )])
 
-    if submit_button:
-        x_span = [df["label"].iloc[0], df["label"].iloc[-1]]
-        for s in bot_supports:
-            fig.add_trace(go.Scatter(x=x_span, y=[s, s], mode="lines", line=dict(color="lime", width=2, dash="dot"), name="Support"))
-        for r in bot_resistances:
-            fig.add_trace(go.Scatter(x=x_span, y=[r, r], mode="lines", line=dict(color="red", width=2, dash="dot"), name="Resistance"))
+    # Bot S&R lines (Calculated ONLY on data up to the current step - no cheating!)
+    if show_bot_lines and len(df_sim) > order * 2:
+        support_idx = argrelextrema(df_sim["low"].values, np.less_equal, order=order)[0]
+        resistance_idx = argrelextrema(df_sim["high"].values, np.greater_equal, order=order)[0]
+        
+        for s in df_sim.iloc[support_idx]["low"].unique():
+            fig.add_shape(type="line", x0=df_sim["label"].iloc[0], x1=df_sim["label"].iloc[-1], y0=s, y1=s, line=dict(color="lime", dash="dot"))
+        for r in df_sim.iloc[resistance_idx]["high"].unique():
+            fig.add_shape(type="line", x0=df_sim["label"].iloc[0], x1=df_sim["label"].iloc[-1], y0=r, y1=r, line=dict(color="red", dash="dot"))
 
     fig.update_layout(
-        template="plotly_dark", height=600, xaxis_rangeslider_visible=False,
-        title=f"{ticker} {timeframe} - Last {hours_to_show if hours_to_show else days_to_fetch} hours/days",
-        dragmode="pan", margin=dict(l=10, r=10, t=40, b=10)
+        template="plotly_dark", height=500, xaxis_rangeslider_visible=False,
+        title=f"Market Time: {current_time}", margin=dict(l=10, r=10, t=40, b=10),
+        dragmode="pan" # Pan mode is best for simulator
     )
-    fig.update_xaxes(type="category", nticks=10)
+    fig.update_xaxes(type="category")
     st.plotly_chart(fig, use_container_width=True)
 
-    st.info("💡 **Tip:** If the bot shows too many lines, increase the **Noise Filter** slider in the sidebar.")
+    # --- TRADING CONTROLS ---
+    st.markdown("### 🎮 Trade Execution")
+    tcol1, tcol2, tcol3, tcol4 = st.columns([1, 1, 1, 2])
+    
+    with tcol1:
+        bet_size = st.number_input("Trade Amount ($)", min_value=10.0, max_value=st.session_state.balance, value=min(100.0, st.session_state.balance), step=10.0)
+    
+    with tcol2:
+        st.write("") # spacing
+        st.write("")
+        if st.button("🟢 BUY", use_container_width=True):
+            if bet_size <= st.session_state.balance:
+                shares_bought = bet_size / current_price
+                st.session_state.balance -= bet_size
+                st.session_state.shares += shares_bought
+                st.session_state.trade_log.append(f"{current_time}: BOUGHT {shares_bought:.2f} shares at ${current_price:.2f}")
+                st.rerun()
+            else:
+                st.error("Not enough cash!")
+
+    with tcol3:
+        st.write("") # spacing
+        st.write("")
+        if st.button("🔴 SELL ALL", use_container_width=True):
+            if st.session_state.shares > 0:
+                proceeds = st.session_state.shares * current_price
+                st.session_state.balance += proceeds
+                st.session_state.trade_log.append(f"{current_time}: SOLD all shares at ${current_price:.2f}. Proceeds: ${proceeds:.2f}")
+                st.session_state.shares = 0.0
+                st.rerun()
+            else:
+                st.warning("No shares to sell!")
+
+    with tcol4:
+        st.write("") # spacing
+        st.write("")
+        # Time progression controls
+        subcol1, subcol2 = st.columns(2)
+        with subcol1:
+            if st.button("▶️ Next 1 Min (Candle)", use_container_width=True):
+                if st.session_state.step < len(st.session_state.df) - 1:
+                    st.session_state.step += 1
+                    st.rerun()
+                else:
+                    st.error("Market closed for the day!")
+        with subcol2:
+            if st.button("⏭️ Fast Forward 5 Min", use_container_width=True):
+                if st.session_state.step < len(st.session_state.df) - 5:
+                    st.session_state.step += 5
+                    st.rerun()
+
+    # --- TRADE LOG ---
+    if st.session_state.trade_log:
+        with st.expander("📝 Trade History"):
+            for log in reversed(st.session_state.trade_log):
+                st.text(log)
 
 else:
-    st.warning("Market might be closed or ticker invalid. Try SPY or AAPL during market hours.")
+    st.info("👈 Use the sidebar to set up your simulator and click **Start Simulation**.")
