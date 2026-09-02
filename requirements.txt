@@ -1,4 +1,4 @@
-openbb>=4.0.0
+yfinance
 streamlit
 plotly
 pandas
