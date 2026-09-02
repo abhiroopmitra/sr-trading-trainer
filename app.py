@@ -200,4 +200,44 @@ if st.session_state.sim_active:
                     st.session_state.shares += shares_bought
                     st.session_state.stop_loss = sl_input
                     st.session_state.trade_log.append(
-                        f"{current_time}: 
+                        f"{current_time}: BOUGHT {shares_bought:.2f} shares at ${current_price:.2f} (SL: ${sl_input:.2f})"
+                    )
+                    st.rerun()
+            else:
+                st.error("Not enough cash!")
+
+    with tcol4:
+        st.write("")
+        st.write("")
+        if st.button("🔴 SELL ALL", use_container_width=True):
+            if st.session_state.shares > 0:
+                proceeds = st.session_state.shares * current_price
+                st.session_state.balance += proceeds
+                st.session_state.trade_log.append(f"{current_time}: SOLD all shares at ${current_price:.2f}. Proceeds: ${proceeds:.2f}")
+                st.session_state.shares = 0.0
+                st.session_state.stop_loss = None
+                st.rerun()
+            else:
+                st.warning("No shares to sell!")
+
+    with tcol5:
+        st.write("")
+        st.write("")
+        subcol1, subcol2 = st.columns(2)
+        with subcol1:
+            if st.button("▶️ Next 1 Min", use_container_width=True):
+                advance_time(1)
+                st.rerun()
+        with subcol2:
+            if st.button("⏭️ Fast Forward 5 Min", use_container_width=True):
+                advance_time(5)
+                st.rerun()
+
+    # Trade Log
+    if st.session_state.trade_log:
+        with st.expander("📝 Trade History"):
+            for log in reversed(st.session_state.trade_log):
+                st.text(log)
+
+else:
+    st.info("👈 Select a Date and Start Time in the sidebar, then click **Start Simulation**.")
