@@ -1,0 +1,6 @@
+openbb>=4.0.0
+streamlit
+plotly
+pandas
+numpy
+scipy
