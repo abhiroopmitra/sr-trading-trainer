@@ -305,8 +305,16 @@ if st.session_state.sim_active:
         row=2, col=1,
     )
     fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="Volume", row=2, col=1)
-
+    # Cap volume axis at 95th percentile so the opening spike
+    # doesn't crush all the other bars into invisibility
+    if len(view_df) > 0 and view_df["volume"].max() > 0:
+        vol_cap = view_df["volume"].quantile(0.95) * 1.15
+        # safety: never cap below the median (avoids over-clipping on quiet days)
+        vol_cap = max(vol_cap, view_df["volume"].median() * 2)
+        fig.update_yaxes(title_text="Volume", range=[0, vol_cap], row=2, col=1)
+    else:
+        fig.update_yaxes(title_text="Volume", row=2, col=1)
+        
     st.plotly_chart(fig, use_container_width=True, config={
         "scrollZoom": True,
         "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
