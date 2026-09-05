@@ -247,7 +247,7 @@ if st.session_state.sim_active:
         fig.add_trace(
             go.Scatter(
                 x=view_df["label"], y=view_df["vol_ma"],
-                line=dict(color="yellow", width=1.5),
+                line=dict(color="#D500F9", width=2),
                 name="Vol MA(20)",
             ),
             row=2, col=1,
