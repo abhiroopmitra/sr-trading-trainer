@@ -1,5 +1,6 @@
 import streamlit as st
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -41,6 +42,9 @@ def fetch_data(ticker, target_date):
         if df["timestamp"].dt.tz is not None:
             df["timestamp"] = df["timestamp"].dt.tz_localize(None)
         df = df.dropna(subset=["close"]).drop_duplicates(subset="timestamp")
+        if "volume" not in df.columns:
+            df["volume"] = 0.0
+        df["volume"] = df["volume"].fillna(0.0)
         df["date_only"] = df["timestamp"].dt.date
         return df.reset_index(drop=True)
     except Exception as e:
@@ -57,8 +61,9 @@ def resample_view(df, timeframe):
         rule = {"5m": "5min", "15m": "15min"}[timeframe]
         out = (df.set_index("timestamp").resample(rule)
                  .agg({"open": "first", "high": "max",
-                       "low": "min", "close": "last"})
-                 .dropna().reset_index())
+                       "low": "min", "close": "last",
+                       "volume": "sum"})
+                 .dropna(subset=["close"]).reset_index())
     out["label"] = out["timestamp"].dt.strftime("%m-%d %H:%M")
     return out
 
@@ -158,6 +163,7 @@ else:
 st.sidebar.markdown("---")
 chart_tf = st.sidebar.radio("📊 Chart View", ["1m", "5m", "15m"], horizontal=True)
 show_context = st.sidebar.checkbox("Show previous days (context)", value=False)
+show_vol_ma = st.sidebar.checkbox("Show volume moving average", value=True)
 st.sidebar.markdown("**✏️ Draw:** line tool in chart toolbar. Scroll = zoom, drag = pan.")
 st.sidebar.caption("Each time step **re-zooms to today** (open → now). Pan left for older days if context is on.")
 
@@ -204,19 +210,58 @@ if st.session_state.sim_active:
 
     # ----- Chart: plot visible bars, camera = today only -----
     view_df = resample_view(visible_1m, chart_tf)
-    fig = go.Figure(data=[go.Candlestick(
-        x=view_df["label"], open=view_df["open"], high=view_df["high"],
-        low=view_df["low"], close=view_df["close"], name=ticker)])
+
+    # Color volume bars green/red to match candle direction
+    vol_colors = np.where(
+        view_df["close"] >= view_df["open"],
+        "rgba(38,166,154,0.5)",   # green (up candle)
+        "rgba(239,83,80,0.5)"     # red (down candle)
+    )
+
+    # 2-row layout: 75% price, 25% volume, shared x-axis
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        vertical_spacing=0.03,
+        row_heights=[0.75, 0.25],
+    )
+
+    fig.add_trace(
+        go.Candlestick(
+            x=view_df["label"], open=view_df["open"], high=view_df["high"],
+            low=view_df["low"], close=view_df["close"], name=ticker,
+        ),
+        row=1, col=1,
+    )
+
+    fig.add_trace(
+        go.Bar(
+            x=view_df["label"], y=view_df["volume"],
+            marker_color=vol_colors, name="Volume",
+        ),
+        row=2, col=1,
+    )
+
+    # Optional volume moving average line
+    if show_vol_ma and len(view_df) >= 20:
+        view_df["vol_ma"] = view_df["volume"].rolling(20).mean()
+        fig.add_trace(
+            go.Scatter(
+                x=view_df["label"], y=view_df["vol_ma"],
+                line=dict(color="yellow", width=1.5),
+                name="Vol MA(20)",
+            ),
+            row=2, col=1,
+        )
 
     if pos != 0:
         if st.session_state.stop_loss:
-            fig.add_hline(y=st.session_state.stop_loss,
+            fig.add_hline(y=st.session_state.stop_loss, row=1, col=1,
                           line=dict(color="orange", width=2, dash="dash"))
         if st.session_state.target:
-            fig.add_hline(y=st.session_state.target,
+            fig.add_hline(y=st.session_state.target, row=1, col=1,
                           line=dict(color="lime", width=2, dash="dash"))
         if st.session_state.entry_price:
-            fig.add_hline(y=st.session_state.entry_price,
+            fig.add_hline(y=st.session_state.entry_price, row=1, col=1,
                           line=dict(color="cyan", width=1, dash="dot"))
 
     today_mask = view_df["timestamp"].dt.date == selected_date
@@ -236,18 +281,32 @@ if st.session_state.sim_active:
         i0, i1 = 0, len(labels) - 1
 
     fig.update_layout(
-        template="plotly_dark", height=600, xaxis_rangeslider_visible=False,
+        template="plotly_dark", height=680, xaxis_rangeslider_visible=False,
         title=f"{ticker} | {chart_tf} view | Sim Time: {current_time}",
         margin=dict(l=10, r=10, t=40, b=10), dragmode="pan",
         newshape=dict(line_color="cyan", line_width=2),
         uirevision="keep-drawings",
+        showlegend=False,
+    )
+
+    # Apply category-axis zoom to BOTH rows (shared x)
+    fig.update_xaxes(
+        type="category",
+        range=[i0 - 0.5, i1 + 0.5],
+        nticks=12,
+        rangeslider_visible=False,
+        row=1, col=1,
     )
     fig.update_xaxes(
         type="category",
         range=[i0 - 0.5, i1 + 0.5],
         nticks=12,
         rangeslider_visible=False,
+        row=2, col=1,
     )
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="Volume", row=2, col=1)
+
     st.plotly_chart(fig, use_container_width=True, config={
         "scrollZoom": True,
         "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
