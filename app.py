@@ -2,242 +2,339 @@ import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
-from scipy.signal import argrelextrema
 import yfinance as yf
+from datetime import datetime, timedelta
 
 st.set_page_config(layout="wide", page_title="S&R Paper Trading Sim")
 
 # ==========================================
-# 1. INITIALIZE SESSION STATE
+# 1. SESSION STATE
 # ==========================================
-if "sim_active" not in st.session_state:
-    st.session_state.sim_active = False
-if "balance" not in st.session_state:
-    st.session_state.balance = 1000.00
-if "shares" not in st.session_state:
-    st.session_state.shares = 0.0
-if "stop_loss" not in st.session_state:
-    st.session_state.stop_loss = None
-if "step" not in st.session_state:
-    st.session_state.step = 0
-if "df" not in st.session_state:
-    st.session_state.df = pd.DataFrame()
-if "trade_log" not in st.session_state:
-    st.session_state.trade_log = []
+defaults = {
+    "sim_active": False, "balance": 1000.00, "shares": 0.0,
+    "stop_loss": None, "target": None, "entry_price": None,
+    "step": 0, "df": pd.DataFrame(), "trade_log": [], "sim_start_idx": 0,
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 # ==========================================
-# 2. DATA FETCHING HELPER
+# 2. DATA FETCHING (multi-day 1m data)
 # ==========================================
 @st.cache_data(ttl=3600)
-def fetch_1m_data(ticker):
+def fetch_data(ticker, target_date):
     try:
-        data = yf.download(ticker, period="7d", interval="1m", auto_adjust=True, progress=False)
-        if data.empty: return None
-        
-        if isinstance(data.columns, pd.MultiIndex): 
+        start = target_date - timedelta(days=7)
+        end = target_date + timedelta(days=1)
+        data = yf.download(ticker, start=start.strftime("%Y-%m-%d"),
+                           end=end.strftime("%Y-%m-%d"), interval="1m",
+                           auto_adjust=True, progress=False)
+        if data.empty:
+            return None
+        if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
-        
         df = data.reset_index()
-        df.columns = [str(col).lower() for col in df.columns]
+        df.columns = [str(c).lower() for c in df.columns]
         df.rename(columns={df.columns[0]: "timestamp"}, inplace=True)
-        
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         if df["timestamp"].dt.tz is not None:
             df["timestamp"] = df["timestamp"].dt.tz_localize(None)
-            
-        df["label"] = df["timestamp"].dt.strftime("%H:%M")
+        df = df.dropna(subset=["close"]).drop_duplicates(subset="timestamp")
         df["date_only"] = df["timestamp"].dt.date
-        df = df.dropna(subset=["close"]).reset_index(drop=True)
-        return df
+        return df.reset_index(drop=True)
     except Exception as e:
         st.error(f"Data Fetch Error: {e}")
         return None
 
 # ==========================================
-# 3. HELPER: STEP FORWARD & CHECK STOP LOSS
+# 3. RESAMPLING (1m -> 5m / 15m view)
+# ==========================================
+def resample_view(df, timeframe):
+    if timeframe == "1m":
+        out = df.copy()
+    else:
+        rule = {"5m": "5min", "15m": "15min"}[timeframe]
+        out = (df.set_index("timestamp").resample(rule)
+                 .agg({"open": "first", "high": "max",
+                       "low": "min", "close": "last"})
+                 .dropna().reset_index())
+    out["label"] = out["timestamp"].dt.strftime("%m-%d %H:%M")
+    return out
+
+# ==========================================
+# 4. POSITION CLOSE HELPER
+# ==========================================
+def close_position(qty, price, time_str, reason=""):
+    """Close qty shares (positive number) of current position at price."""
+    pos = st.session_state.shares
+    if pos > 0:  # long -> sell
+        qty = min(qty, pos)
+        st.session_state.balance += qty * price
+        st.session_state.shares -= qty
+        st.session_state.trade_log.append(
+            f"{time_str}: SOLD {qty:.4f} sh at ${price:.2f} {reason}")
+    elif pos < 0:  # short -> buy to cover
+        qty = min(qty, abs(pos))
+        st.session_state.balance -= qty * price
+        st.session_state.shares += qty
+        st.session_state.trade_log.append(
+            f"{time_str}: COVERED {qty:.4f} sh at ${price:.2f} {reason}")
+    if st.session_state.shares == 0:
+        st.session_state.stop_loss = None
+        st.session_state.target = None
+        st.session_state.entry_price = None
+
+# ==========================================
+# 5. TIME ADVANCE + SL/TARGET CHECKS (1m engine)
 # ==========================================
 def advance_time(steps_to_move):
-    """Advances time candle by candle, checking for Stop-Loss triggers."""
     max_steps = len(st.session_state.df) - 1
-    
     for _ in range(steps_to_move):
         if st.session_state.step >= max_steps:
-            st.toast("⚠️ Market closed for the day!", icon="🔔")
+            st.toast("Market closed for the day!", icon="🔔")
             break
-            
         st.session_state.step += 1
-        current_candle = st.session_state.df.iloc[st.session_state.step]
-        candle_low = current_candle["low"]
-        candle_time = current_candle["label"]
-        
-        # Check Stop Loss Trigger
-        if st.session_state.shares > 0 and st.session_state.stop_loss is not None:
-            if candle_low <= st.session_state.stop_loss:
-                # Execution Price (Stop-Loss price or candle open if gap down)
-                exec_price = min(st.session_state.stop_loss, current_candle["open"])
-                proceeds = st.session_state.shares * exec_price
-                st.session_state.balance += proceeds
-                
-                st.session_state.trade_log.append(
-                    f"🛑 STOP-LOSS TRIGGERED at {candle_time}! Sold {st.session_state.shares:.2f} shares at ${exec_price:.2f}. Proceeds: ${proceeds:.2f}"
-                )
-                st.toast(f"🛑 STOP-LOSS TRIGGERED at ${exec_price:.2f}!", icon="💥")
-                
-                st.session_state.shares = 0.0
-                st.session_state.stop_loss = None
-                break  # Stop advancing time on trigger so user can inspect chart
+        candle = st.session_state.df.iloc[st.session_state.step]
+        t = candle["timestamp"].strftime("%H:%M")
+        pos = st.session_state.shares
+        sl, tp = st.session_state.stop_loss, st.session_state.target
+
+        if pos > 0:  # ---- LONG ----
+            if sl is not None and candle["low"] <= sl:
+                exec_p = min(sl, candle["open"])
+                close_position(pos, exec_p, t, "(🛑 STOP-LOSS)")
+                st.toast(f"🛑 Long stopped out at ${exec_p:.2f}", icon="💥")
+                break
+            if tp is not None and candle["high"] >= tp:
+                exec_p = max(tp, candle["open"])
+                close_position(pos, exec_p, t, "(🎯 TARGET HIT)")
+                st.toast(f"🎯 Target hit! Sold at ${exec_p:.2f}", icon="🎉")
+                break
+        elif pos < 0:  # ---- SHORT ----
+            if sl is not None and candle["high"] >= sl:
+                exec_p = max(sl, candle["open"])
+                close_position(abs(pos), exec_p, t, "(🛑 STOP-LOSS)")
+                st.toast(f"🛑 Short stopped out at ${exec_p:.2f}", icon="💥")
+                break
+            if tp is not None and candle["low"] <= tp:
+                exec_p = min(tp, candle["open"])
+                close_position(abs(pos), exec_p, t, "(🎯 TARGET HIT)")
+                st.toast(f"🎯 Target hit! Covered at ${exec_p:.2f}", icon="🎉")
+                break
 
 # ==========================================
-# 4. SIDEBAR: SIMULATOR SETUP
+# 6. SIDEBAR SETUP
 # ==========================================
-st.sidebar.header("⚙️ 1. Setup Simulation")
+st.sidebar.header("⚙️ Setup")
 ticker = st.sidebar.text_input("Ticker", value="SPY").upper()
+default_date = datetime.now().date() - timedelta(days=2)
+selected_date = st.sidebar.date_input("Trading Date", value=default_date,
+                                      max_value=datetime.now().date())
 
-raw_df = fetch_1m_data(ticker)
+raw_df = fetch_data(ticker, selected_date)
 
-if raw_df is not None and not raw_df.empty:
-    available_dates = raw_df["date_only"].unique()
-    selected_date = st.sidebar.selectbox("Select Day to Trade", available_dates)
-    
-    day_df = raw_df[raw_df["date_only"] == selected_date].reset_index(drop=True)
-    times = day_df["label"].tolist()
-    default_idx = min(90, len(times) - 1) if len(times) > 90 else 0
-    start_time = st.sidebar.selectbox("Start Time", times, index=default_idx)
+if raw_df is not None and selected_date in raw_df["date_only"].values:
+    day_mask = raw_df["date_only"] == selected_date
+    day_labels = raw_df.loc[day_mask, "timestamp"].dt.strftime("%H:%M").tolist()
+    default_idx = min(90, len(day_labels) - 1)
+    start_time = st.sidebar.selectbox("Start Time", day_labels, index=default_idx)
 
     if st.sidebar.button("🚀 Start / Reset Simulation"):
-        st.session_state.df = day_df
-        st.session_state.step = day_df[day_df["label"] == start_time].index[0]
-        st.session_state.balance = 1000.00
+        st.session_state.df = raw_df
+        day_indices = raw_df.index[day_mask].tolist()
+        st.session_state.sim_start_idx = day_indices[0]
+        st.session_state.step = day_indices[day_labels.index(start_time)]
+        for k in ["balance"]: st.session_state[k] = 1000.00
         st.session_state.shares = 0.0
         st.session_state.stop_loss = None
+        st.session_state.target = None
+        st.session_state.entry_price = None
         st.session_state.trade_log = []
         st.session_state.sim_active = True
         st.rerun()
+else:
+    st.sidebar.error("No 1m data for this date (market closed or too old).")
 
 st.sidebar.markdown("---")
-show_bot_lines = st.sidebar.checkbox("Show Bot S&R Lines", value=False)
-order = st.sidebar.slider("Bot Sensitivity", 5, 50, 20)
+chart_tf = st.sidebar.radio("📊 Chart View", ["1m", "5m", "15m"], horizontal=True)
+show_context = st.sidebar.checkbox("Show previous days (context)", value=True)
+st.sidebar.markdown("**✏️ Draw:** line tool in chart toolbar. Scroll = zoom, drag = pan.")
 
 # ==========================================
-# 5. MAIN TRADING DASHBOARD
+# 7. MAIN DASHBOARD
 # ==========================================
 st.title("💹 Market Replay Simulator")
 
 if st.session_state.sim_active:
-    current_step = st.session_state.step
-    df_sim = st.session_state.df.iloc[:current_step + 1]
-    current_price = df_sim.iloc[-1]["close"]
-    current_time = df_sim.iloc[-1]["label"]
+    step = st.session_state.step
+    full_df = st.session_state.df
+    visible_1m = full_df.iloc[:step + 1] if show_context else \
+                 full_df.iloc[st.session_state.sim_start_idx: step + 1]
 
-    # Calculate portfolio values
-    position_value = st.session_state.shares * current_price
+    current_price = full_df.iloc[step]["close"]
+    current_time = full_df.iloc[step]["timestamp"].strftime("%H:%M")
+    pos = st.session_state.shares
+
+    # Portfolio metrics (works for long AND short)
+    position_value = pos * current_price
     total_equity = st.session_state.balance + position_value
     pnl = total_equity - 1000.00
     pnl_color = "normal" if pnl == 0 else ("inverse" if pnl > 0 else "off")
 
-    # Metrics Bar
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Current Price", f"${current_price:.2f}")
-    col2.metric("Total Equity", f"${total_equity:.2f}", f"${pnl:.2f}", delta_color=pnl_color)
-    col3.metric("Cash Available", f"${st.session_state.balance:.2f}")
-    col4.metric("Open Position", f"{st.session_state.shares:.4f} shares", f"${position_value:.2f}")
-    col5.metric("Active Stop-Loss", f"${st.session_state.stop_loss:.2f}" if st.session_state.stop_loss else "None")
+    if pos > 0:
+        pos_text, pos_type = f"{pos:.4f} sh", "🟢 LONG"
+    elif pos < 0:
+        pos_text, pos_type = f"{abs(pos):.4f} sh", "🔴 SHORT"
+    else:
+        pos_text, pos_type = "—", "FLAT"
 
-    # Candlestick Chart
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Price", f"${current_price:.2f}")
+    c2.metric("Equity", f"${total_equity:.2f}", f"${pnl:.2f}", delta_color=pnl_color)
+    c3.metric("Cash", f"${st.session_state.balance:.2f}")
+    c4.metric(f"Position ({pos_type})", pos_text,
+              f"Entry ${st.session_state.entry_price:.2f}" if st.session_state.entry_price else "")
+    c5.metric("Stop-Loss", f"${st.session_state.stop_loss:.2f}" if st.session_state.stop_loss else "None")
+    c6.metric("Target", f"${st.session_state.target:.2f}" if st.session_state.target else "None")
+
+    # Chart
+    view_df = resample_view(visible_1m, chart_tf)
     fig = go.Figure(data=[go.Candlestick(
-        x=df_sim["label"], open=df_sim["open"], high=df_sim["high"],
-        low=df_sim["low"], close=df_sim["close"], name=ticker
-    )])
+        x=view_df["label"], open=view_df["open"], high=view_df["high"],
+        low=view_df["low"], close=view_df["close"], name=ticker)])
 
-    # Bot S&R lines
-    if show_bot_lines and len(df_sim) > order * 2:
-        support_idx = argrelextrema(df_sim["low"].values, np.less_equal, order=order)[0]
-        resistance_idx = argrelextrema(df_sim["high"].values, np.greater_equal, order=order)[0]
-        
-        for s in df_sim.iloc[support_idx]["low"].unique():
-            fig.add_shape(type="line", x0=df_sim["label"].iloc[0], x1=df_sim["label"].iloc[-1], y0=s, y1=s, line=dict(color="lime", dash="dot"))
-        for r in df_sim.iloc[resistance_idx]["high"].unique():
-            fig.add_shape(type="line", x0=df_sim["label"].iloc[0], x1=df_sim["label"].iloc[-1], y0=r, y1=r, line=dict(color="red", dash="dot"))
-
-    # Active Stop-Loss Line (Orange Dashed Line)
-    if st.session_state.shares > 0 and st.session_state.stop_loss:
-        fig.add_shape(
-            type="line", x0=df_sim["label"].iloc[0], x1=df_sim["label"].iloc[-1],
-            y0=st.session_state.stop_loss, y1=st.session_state.stop_loss,
-            line=dict(color="orange", width=2, dash="dash")
-        )
+    if pos != 0:
+        if st.session_state.stop_loss:
+            fig.add_hline(y=st.session_state.stop_loss,
+                          line=dict(color="orange", width=2, dash="dash"))
+        if st.session_state.target:
+            fig.add_hline(y=st.session_state.target,
+                          line=dict(color="lime", width=2, dash="dash"))
+        if st.session_state.entry_price:
+            fig.add_hline(y=st.session_state.entry_price,
+                          line=dict(color="cyan", width=1, dash="dot"))
 
     fig.update_layout(
-        template="plotly_dark", height=500, xaxis_rangeslider_visible=False,
-        title=f"Market Time: {current_time}", margin=dict(l=10, r=10, t=40, b=10),
-        dragmode="pan"
-    )
-    fig.update_xaxes(type="category")
-    st.plotly_chart(fig, use_container_width=True)
+        template="plotly_dark", height=600, xaxis_rangeslider_visible=False,
+        title=f"{ticker} | {chart_tf} view | Sim Time: {current_time}",
+        margin=dict(l=10, r=10, t=40, b=10), dragmode="pan",
+        newshape=dict(line_color="cyan", line_width=2),
+        uirevision="keep-drawings")
+    fig.update_xaxes(type="category", nticks=12)
+    st.plotly_chart(fig, use_container_width=True, config={
+        "scrollZoom": True,
+        "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
+        "displaylogo": False})
 
-    # Trading Execution Controls
-    st.markdown("### 🎮 Trade Execution")
-    tcol1, tcol2, tcol3, tcol4, tcol5 = st.columns([1.2, 1.2, 1, 1, 2])
-    
-    with tcol1:
-        bet_size = st.number_input("Trade Amount ($)", min_value=10.0, max_value=max(10.0, st.session_state.balance), value=min(100.0, st.session_state.balance), step=10.0)
-    
-    with tcol2:
-        # Default stop-loss is set 0.5% below current price
-        default_sl = round(current_price * 0.995, 2)
-        sl_input = st.number_input("Stop-Loss Price ($)", min_value=0.0, max_value=current_price, value=default_sl, step=0.10)
-
-    with tcol3:
-        st.write("")
-        st.write("")
-        if st.button("🟢 BUY", use_container_width=True):
-            if bet_size <= st.session_state.balance:
+    # ==========================================
+    # ENTRY PANEL (only when flat)
+    # ==========================================
+    if pos == 0:
+        st.markdown("### 🎮 Open a Position")
+        e1, e2, e3, e4, e5 = st.columns([1.2, 1.2, 1.2, 1, 1])
+        with e1:
+            bet_size = st.number_input("Trade Amount ($)", 10.0,
+                                       max(10.0, st.session_state.balance),
+                                       min(100.0, st.session_state.balance), 10.0)
+        with e2:
+            sl_input = st.number_input("Stop-Loss ($)", value=round(current_price * 0.995, 2), step=0.05)
+        with e3:
+            tp_input = st.number_input("Target ($, 0 = none)", value=0.0, step=0.05)
+        with e4:
+            st.write(""); st.write("")
+            if st.button("🟢 BUY (Long)", use_container_width=True):
                 if sl_input >= current_price:
-                    st.error("Stop-loss must be below current price!")
+                    st.error("Long stop-loss must be BELOW current price!")
+                elif tp_input != 0 and tp_input <= current_price:
+                    st.error("Long target must be ABOVE current price!")
                 else:
-                    shares_bought = bet_size / current_price
+                    sh = bet_size / current_price
                     st.session_state.balance -= bet_size
-                    st.session_state.shares += shares_bought
+                    st.session_state.shares = sh
                     st.session_state.stop_loss = sl_input
+                    st.session_state.target = tp_input if tp_input > 0 else None
+                    st.session_state.entry_price = current_price
                     st.session_state.trade_log.append(
-                        f"{current_time}: BOUGHT {shares_bought:.2f} shares at ${current_price:.2f} (SL: ${sl_input:.2f})"
-                    )
+                        f"{current_time}: BOUGHT {sh:.4f} sh at ${current_price:.2f} "
+                        f"(SL ${sl_input:.2f} / TP {'$'+format(tp_input,'.2f') if tp_input>0 else '—'})")
                     st.rerun()
-            else:
-                st.error("Not enough cash!")
+        with e5:
+            st.write(""); st.write("")
+            if st.button("🔻 SHORT", use_container_width=True):
+                if sl_input <= current_price:
+                    st.error("Short stop-loss must be ABOVE current price!")
+                elif tp_input != 0 and tp_input >= current_price:
+                    st.error("Short target must be BELOW current price!")
+                else:
+                    sh = bet_size / current_price
+                    st.session_state.balance += bet_size          # short sale proceeds
+                    st.session_state.shares = -sh
+                    st.session_state.stop_loss = sl_input
+                    st.session_state.target = tp_input if tp_input > 0 else None
+                    st.session_state.entry_price = current_price
+                    st.session_state.trade_log.append(
+                        f"{current_time}: SHORTED {sh:.4f} sh at ${current_price:.2f} "
+                        f"(SL ${sl_input:.2f} / TP {'$'+format(tp_input,'.2f') if tp_input>0 else '—'})")
+                    st.rerun()
 
-    with tcol4:
-        st.write("")
-        st.write("")
-        if st.button("🔴 SELL ALL", use_container_width=True):
-            if st.session_state.shares > 0:
-                proceeds = st.session_state.shares * current_price
-                st.session_state.balance += proceeds
-                st.session_state.trade_log.append(f"{current_time}: SOLD all shares at ${current_price:.2f}. Proceeds: ${proceeds:.2f}")
-                st.session_state.shares = 0.0
-                st.session_state.stop_loss = None
-                st.rerun()
-            else:
-                st.warning("No shares to sell!")
+    # ==========================================
+    # MANAGEMENT PANEL (when in a position)
+    # ==========================================
+    else:
+        st.markdown(f"### 🎮 Manage {pos_type} Position")
+        m1, m2, m3, m4, m5 = st.columns([1.2, 1.2, 1.2, 1, 1])
+        with m1:
+            new_sl = st.number_input("Modify Stop-Loss ($)",
+                                     value=float(st.session_state.stop_loss or current_price),
+                                     step=0.05, key="mod_sl")
+        with m2:
+            new_tp = st.number_input("Modify Target ($, 0 = none)",
+                                     value=float(st.session_state.target or 0.0),
+                                     step=0.05, key="mod_tp")
+        with m3:
+            close_qty = st.number_input("Qty to Close (shares)",
+                                        min_value=0.0, max_value=float(abs(pos)),
+                                        value=float(abs(pos)), step=0.01)
+        with m4:
+            st.write(""); st.write("")
+            if st.button("💾 Update SL/TP", use_container_width=True):
+                valid = True
+                if pos > 0 and new_sl >= current_price:
+                    st.error("Long SL must be below price!"); valid = False
+                if pos < 0 and new_sl <= current_price:
+                    st.error("Short SL must be above price!"); valid = False
+                if valid:
+                    st.session_state.stop_loss = new_sl
+                    st.session_state.target = new_tp if new_tp > 0 else None
+                    st.session_state.trade_log.append(
+                        f"{current_time}: UPDATED SL to ${new_sl:.2f}, "
+                        f"TP to {'$'+format(new_tp,'.2f') if new_tp>0 else '—'}")
+                    st.rerun()
+        with m5:
+            st.write(""); st.write("")
+            btn_label = "🔴 SELL" if pos > 0 else "🟢 COVER"
+            if st.button(f"{btn_label} {close_qty:.2f} sh", use_container_width=True):
+                if close_qty > 0:
+                    close_position(close_qty, current_price, current_time, "(manual)")
+                    st.rerun()
 
-    with tcol5:
-        st.write("")
-        st.write("")
-        subcol1, subcol2 = st.columns(2)
-        with subcol1:
-            if st.button("▶️ Next 1 Min", use_container_width=True):
-                advance_time(1)
-                st.rerun()
-        with subcol2:
-            if st.button("⏭️ Fast Forward 5 Min", use_container_width=True):
-                advance_time(5)
-                st.rerun()
+    # Time controls (always visible)
+    st.markdown("#### ⏱️ Advance Time")
+    a1, a2, a3, _ = st.columns([1, 1, 1, 3])
+    with a1:
+        if st.button("▶️ +1 Min", use_container_width=True):
+            advance_time(1); st.rerun()
+    with a2:
+        if st.button("⏩ +5 Min", use_container_width=True):
+            advance_time(5); st.rerun()
+    with a3:
+        if st.button("⏭️ +15 Min", use_container_width=True):
+            advance_time(15); st.rerun()
 
-    # Trade Log
     if st.session_state.trade_log:
-        with st.expander("📝 Trade History"):
+        with st.expander("📝 Trade History", expanded=True):
             for log in reversed(st.session_state.trade_log):
                 st.text(log)
-
 else:
-    st.info("👈 Select a Date and Start Time in the sidebar, then click **Start Simulation**.")
+    st.info("👈 Pick a date and start time, then click **Start Simulation**.")
