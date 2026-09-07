@@ -356,14 +356,13 @@ if st.session_state.sim_active:
     full_df = st.session_state.df
     sim0 = st.session_state.sim_start_idx
 
-    # Visible bars for candles: today only (or with context)
     today_1m = full_df.iloc[sim0: step + 1]
     if show_context:
         visible_1m = full_df.iloc[: step + 1]
     else:
         visible_1m = today_1m
 
-    # ---- KEY: For EMA, use the FULL history up to now (all days) ----
+    # ---- For EMA: use FULL history up to now ----
     hist_1m = full_df.iloc[: step + 1]
 
     current_price = full_df.iloc[step]["close"]
@@ -392,10 +391,10 @@ if st.session_state.sim_active:
     c6.metric("Target", f"${st.session_state.target:.2f}" if st.session_state.target else "None")
 
     # ---- Resample views ----
-    view_df = resample_view(visible_1m, chart_tf)      # for candles (today / context)
-    hist_view = resample_view(hist_1m, chart_tf)       # for EMA (full history)
+    view_df = resample_view(visible_1m, chart_tf)
+    hist_view = resample_view(hist_1m, chart_tf)
 
-    # ---- 2-row layout ----
+    # ---- Build figure ----
     vol_colors = np.where(
         view_df["close"] >= view_df["open"],
         "rgba(38,166,154,0.6)", "rgba(239,83,80,0.6)"
@@ -414,25 +413,24 @@ if st.session_state.sim_active:
         x=view_df["label"], y=view_df["volume"], marker_color=vol_colors, name="Volume",
     ), row=2, col=1)
 
-    # ---- EMAs computed on FULL history, then merged onto visible labels ----
+    # ---- EMAs on FULL history, filtered to visible labels ----
     if show_ma and len(hist_view) >= 2:
         hist_view = hist_view.copy()
         hist_view["fast_ma"] = moving_avg(hist_view["close"], fast_len, ma_type)
         hist_view["slow_ma"] = moving_avg(hist_view["close"], slow_len, ma_type)
-        # keep only the labels currently visible on the chart
         ema_plot = hist_view[hist_view["label"].isin(view_df["label"])]
         fig.add_trace(go.Scatter(
             x=ema_plot["label"], y=ema_plot["fast_ma"],
-            line=dict(color="#3b82f6", width=1.6),   # blue = fast
+            line=dict(color="#3b82f6", width=1.6),
             name=f"{ma_type}{fast_len} ({chart_tf})",
         ), row=1, col=1)
         fig.add_trace(go.Scatter(
             x=ema_plot["label"], y=ema_plot["slow_ma"],
-            line=dict(color="#f59e0b", width=1.6),    # amber = slow
+            line=dict(color="#f59e0b", width=1.6),
             name=f"{ma_type}{slow_len} ({chart_tf})",
         ), row=1, col=1)
 
-    # ---- Structure labels + zones (computed on visible view) ----
+    # ---- Structure labels + zones ----
     noise = float((view_df["high"] - view_df["low"]).tail(20).mean() or 0.3)
     if show_struct or show_zones:
         labeled = _raw_swings(view_df)
@@ -499,7 +497,7 @@ if st.session_state.sim_active:
             fig.add_hline(y=st.session_state.entry_price, row=1, col=1,
                           line=dict(color="#22d3ee", width=1, dash="dot"))
 
-    # ---- Camera zoom: TODAY only (regardless of EMA history) ----
+    # ---- Camera zoom: TODAY only ----
     today_mask = view_df["timestamp"].dt.date == selected_date
     today_view = view_df.loc[today_mask]
     labels = view_df["label"].tolist()
@@ -516,12 +514,12 @@ if st.session_state.sim_active:
 
     # ---- BLACK THEME layout ----
     fig.update_layout(
-        template="plotly_dark", height=720, dragmode="pan",
+        template="plotly_dark", height=620, dragmode="pan",
         paper_bgcolor="#000000", plot_bgcolor="#000000",
         font=dict(color="#e5e7eb"),
         xaxis_rangeslider_visible=False,
         title=f"{ticker} | {chart_tf} view | Sim Time: {current_time}",
-        margin=dict(l=10, r=160, t=40, b=10),
+        margin=dict(l=10, r=140, t=40, b=10),
         newshape=dict(line_color="#22d3ee", line_width=2),
         uirevision="keep-drawings", showlegend=True,
         legend=dict(bgcolor="rgba(0,0,0,0.5)", font=dict(color="#e5e7eb")),
@@ -535,7 +533,6 @@ if st.session_state.sim_active:
     fig.update_yaxes(title_text="Price", gridcolor="#1f2937",
                      linecolor="#4b5563", row=1, col=1)
 
-    # Volume axis cap (opening-spike fix)
     if len(view_df) and view_df["volume"].max() > 0:
         cap = max(view_df["volume"].quantile(0.95) * 1.15, view_df["volume"].median() * 2)
         fig.update_yaxes(range=[0, cap], title_text="Volume", gridcolor="#1f2937",
@@ -544,14 +541,38 @@ if st.session_state.sim_active:
         fig.update_yaxes(title_text="Volume", gridcolor="#1f2937",
                          linecolor="#4b5563", row=2, col=1)
 
-    st.plotly_chart(fig, use_container_width=True, config={
-        "scrollZoom": True,
-        "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
-        "displaylogo": False,
-    })
+    # ==========================================
+    # CHART (left) + TIME CONTROLS (right)
+    # ==========================================
+    chart_col, ctrl_col = st.columns([8, 1])
+
+    with chart_col:
+        st.plotly_chart(fig, use_container_width=True, config={
+            "scrollZoom": True,
+            "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
+            "displaylogo": False,
+        })
+
+    with ctrl_col:
+        st.markdown("#### ⏱️")
+        st.caption(f"**{current_time}**")
+        if st.button("▶️ +1 Min", use_container_width=True, key="adv1"):
+            advance_time(1); st.rerun()
+        if st.button("⏩ +5 Min", use_container_width=True, key="adv5"):
+            advance_time(5); st.rerun()
+        if st.button("⏭️ +15 Min", use_container_width=True, key="adv15"):
+            advance_time(15); st.rerun()
+        st.markdown("---")
+        st.caption(f"Trend view:\n{chart_tf}")
+        if pos > 0:
+            st.success("🟢 LONG")
+        elif pos < 0:
+            st.error("🔴 SHORT")
+        else:
+            st.info("FLAT")
 
     # ==========================================
-    # ENTRY PANEL
+    # ENTRY / MANAGEMENT PANEL
     # ==========================================
     if pos == 0:
         st.markdown("### 🎮 Open a Position")
@@ -637,18 +658,6 @@ if st.session_state.sim_active:
                 if close_qty > 0:
                     close_position(close_qty, current_price, current_time, "(manual)")
                     st.rerun()
-
-    st.markdown("#### ⏱️ Advance Time")
-    a1, a2, a3, _ = st.columns([1, 1, 1, 3])
-    with a1:
-        if st.button("▶️ +1 Min", use_container_width=True):
-            advance_time(1); st.rerun()
-    with a2:
-        if st.button("⏩ +5 Min", use_container_width=True):
-            advance_time(5); st.rerun()
-    with a3:
-        if st.button("⏭️ +15 Min", use_container_width=True):
-            advance_time(15); st.rerun()
 
     if st.session_state.trade_log:
         with st.expander("📝 Trade History", expanded=True):
