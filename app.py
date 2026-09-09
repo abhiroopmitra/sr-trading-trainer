@@ -2192,3 +2192,49 @@ with st.expander("\U0001f4d8 Replay Information", expanded=False):
 | Continuous | `{'Yes' if is_continuous else 'No'}` |
 | Native timeframe | `{st.session_state.active_interval}` |
 | Session mode | `{st.session_state.active_session_mode}` |
+| Practice session | `{practice_date}` |
+| Current replay time | `{current_time_text}` |
+| Current session date | `{current_session_date}` |
+| Revealed bars | `{len(revealed_df):,}` |
+| Rendered bars | `{len(chart_df):,}` |
+| Visible bars | `{window_end - window_start + 1}` |
+| Follow replay | `{"ON" if follow_replay else "OFF"}` |
+| Follow window | `{'220 bars (continuous)' if (follow_replay and is_continuous) else 'Current session' if follow_replay else 'Full context'}` |
+| Position carry | `{"ON" if st.session_state.active_carry_mode else "OFF"}` |
+| Account cycle | `{account['cycle_number']}` |
+| Database | `{os.path.abspath(DB_PATH)}` |
+
+### Session behavior
+
+- US stocks and ETFs use regular market hours by default.
+- Overnight, weekends, holidays, and regular-hours gaps are removed.
+- Futures retain the overnight session but remove the daily maintenance break.
+- Forex continues through weekdays and skips the weekend.
+- Crypto retains all bars because crypto trades continuously.
+- The chart uses sequential bar positions instead of calendar timestamps.
+- Actual price gaps remain visible because OHLC prices are unchanged.
+
+### Follow camera behavior
+
+- **Continuous instruments** (futures, forex, crypto):
+  Follow ON shows the last **{FOLLOW_WINDOW_BARS} bars** ending at the
+  current replay bar. The window slides forward as you advance.
+  Crossing a session boundary, midnight, or calendar day does NOT
+  reset the view. Previous bars remain visible as long as they are
+  within the {FOLLOW_WINDOW_BARS}-bar lookback.
+
+- **Session-based instruments** (stocks, ETFs):
+  Follow ON zooms into the current practice session
+  (e.g. 09:30-16:00). The next session starts fresh.
+
+### Account behavior
+
+- Cash and trades persist in SQLite.
+- The wallet survives browser refreshes and app restarts.
+- Positions remain open across sessions when position carry is enabled.
+- Equity equals cash plus the current marked value of the open position.
+- Account reset occurs only after the account is actually depleted.
+- Realized P&L is tracked per closed trade and accumulated in the account.
+- Unrealized P&L is calculated live from the current mark price.
+"""
+    )
