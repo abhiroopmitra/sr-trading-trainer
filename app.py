@@ -1,21 +1,17 @@
 # ============================================================
 # HUMAN MARKET REPLAY SIMULATOR
 #
-# Native Yahoo timeframe data:
-#   1m  -> ~7 days
-#   2m  -> ~60 days
-#   5m  -> ~60 days
-#   15m -> ~60 days
-#   30m -> ~60 days
-#   90m -> ~60 days
-#   1h  -> ~2 years
-#   1d  -> ~10 years
-#
-# Important:
-# - 5m/15m candles are fetched as NATIVE Yahoo candles.
-# - They are NOT resampled from 1m candles.
-# - Historical prior days are fully available.
-# - The selected replay day is revealed bar-by-bar.
+# FIXED VERSION:
+# - Native Yahoo timeframe data: 1m, 2m, 5m, 15m, 30m, 1h, 1d
+# - Native 5m/15m data is NOT built from 1m bars
+# - Yahoo rolling-period fetch avoids old-date request failure
+# - Validates malformed OHLC bars before charting
+# - Uses full revealed history for EMA calculations
+# - Renders only chosen context bars for speed
+# - Limits structure labels/zones for performance
+# - Follow replay mode focuses BOTH x-axis and y-axis on current day
+# - Right-side advance buttons
+# - Persistent manual drawings
 # ============================================================
 
 import streamlit as st
@@ -24,12 +20,11 @@ from plotly.subplots import make_subplots
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from datetime import datetime, timedelta
 
 st.set_page_config(layout="wide", page_title="Market Replay Simulator")
 
 # ============================================================
-# TIMEFRAME CONFIGURATION
+# TIMEFRAME SETTINGS
 # ============================================================
 TIMEFRAME_CONFIG = {
     "1m": {
@@ -37,7 +32,7 @@ TIMEFRAME_CONFIG = {
         "period": "7d",
         "fallback_period": "6d",
         "ema": (9, 21),
-        "step_minutes": 1,
+        "minutes": 1,
         "intraday": True,
     },
     "2m": {
@@ -45,7 +40,7 @@ TIMEFRAME_CONFIG = {
         "period": "60d",
         "fallback_period": "59d",
         "ema": (9, 21),
-        "step_minutes": 2,
+        "minutes": 2,
         "intraday": True,
     },
     "5m": {
@@ -53,7 +48,7 @@ TIMEFRAME_CONFIG = {
         "period": "60d",
         "fallback_period": "59d",
         "ema": (20, 50),
-        "step_minutes": 5,
+        "minutes": 5,
         "intraday": True,
     },
     "15m": {
@@ -61,7 +56,7 @@ TIMEFRAME_CONFIG = {
         "period": "60d",
         "fallback_period": "59d",
         "ema": (50, 200),
-        "step_minutes": 15,
+        "minutes": 15,
         "intraday": True,
     },
     "30m": {
@@ -69,7 +64,7 @@ TIMEFRAME_CONFIG = {
         "period": "60d",
         "fallback_period": "59d",
         "ema": (50, 200),
-        "step_minutes": 30,
+        "minutes": 30,
         "intraday": True,
     },
     "90m": {
@@ -77,7 +72,7 @@ TIMEFRAME_CONFIG = {
         "period": "60d",
         "fallback_period": "59d",
         "ema": (50, 100),
-        "step_minutes": 90,
+        "minutes": 90,
         "intraday": True,
     },
     "1h": {
@@ -85,7 +80,7 @@ TIMEFRAME_CONFIG = {
         "period": "2y",
         "fallback_period": "1y",
         "ema": (50, 200),
-        "step_minutes": 60,
+        "minutes": 60,
         "intraday": True,
     },
     "1d": {
@@ -93,7 +88,7 @@ TIMEFRAME_CONFIG = {
         "period": "10y",
         "fallback_period": "5y",
         "ema": (50, 200),
-        "step_minutes": 24 * 60,
+        "minutes": 1440,
         "intraday": False,
     },
 }
@@ -118,7 +113,19 @@ DRAW_MODES = [
 ]
 
 # ============================================================
-# STRUCTURE SETTINGS
+# PERFORMANCE SETTINGS
+# ============================================================
+# Structure calculation is intentionally limited.
+# EMAs still use ALL revealed history.
+MAX_STRUCTURE_BARS = 700
+MAX_SWING_LABELS = 90
+MAX_BOS_LABELS = 30
+MAX_CHOCH_LABELS = 20
+MAX_ZONE_SWINGS = 180
+MAX_ZONES_DRAWN = 10
+
+# ============================================================
+# MARKET STRUCTURE SETTINGS
 # ============================================================
 SWING_K = 5
 ZONE_TOL = 0.0012
@@ -128,7 +135,7 @@ POLARITY_EDGE = 2
 CHOCH_ENABLE = True
 
 # ============================================================
-# BLACK THEME COLORS
+# COLORS - BLACK CHART
 # ============================================================
 C_HH = dict(fg="#ffffff", bg="#16a34a")
 C_LH = dict(fg="#ffffff", bg="#dc2626")
@@ -169,10 +176,10 @@ defaults = {
     "markers": [],
     "drawings": [],
     "draw_clicks": [],
-    "last_draw_event": None,
+    "last_draw_signature": None,
     "last_draw_mode": "None",
-    "camera_revision": 0,
     "camera_signature": None,
+    "camera_revision": 0,
     "force_camera": True,
 }
 
@@ -180,107 +187,166 @@ for key, value in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
+# ============================================================
+# DATA FUNCTIONS
+# ============================================================
+def find_column(df, possible_names):
+    """Find the first matching column name, case-insensitive."""
+    lower_map = {str(col).strip().lower(): col for col in df.columns}
 
-# ============================================================
-# DATA HELPERS
-# ============================================================
-def normalize_ohlcv(raw: pd.DataFrame) -> pd.DataFrame:
+    for name in possible_names:
+        if name.lower() in lower_map:
+            return lower_map[name.lower()]
+
+    return None
+
+
+def normalize_ohlcv(raw, intraday=True):
     """
-    Normalize Yahoo/yfinance data to:
-    timestamp, open, high, low, close, volume, date_only, label
+    Converts Yahoo/yfinance output into:
+    timestamp, open, high, low, close, volume, date_only
     """
+
     if raw is None or raw.empty:
         return pd.DataFrame()
 
     df = raw.copy()
 
+    # Yahoo frequently returns MultiIndex columns.
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+        df.columns = [str(col[0]) for col in df.columns]
 
     df = df.reset_index()
-    df.columns = [str(c).lower() for c in df.columns]
 
-    timestamp_col = None
-    for col in df.columns:
-        if col in ("datetime", "date", "index"):
-            timestamp_col = col
-            break
+    timestamp_col = df.columns[0]
 
-    if timestamp_col is None:
-        timestamp_col = df.columns[0]
+    open_col = find_column(df, ["Open"])
+    high_col = find_column(df, ["High"])
+    low_col = find_column(df, ["Low"])
+    close_col = find_column(df, ["Close", "Adj Close"])
+    volume_col = find_column(df, ["Volume"])
 
-    df.rename(columns={timestamp_col: "timestamp"}, inplace=True)
-
-    rename_map = {}
-    for col in df.columns:
-        col_lower = str(col).lower()
-
-        if col_lower.startswith("open"):
-            rename_map[col] = "open"
-        elif col_lower.startswith("high"):
-            rename_map[col] = "high"
-        elif col_lower.startswith("low"):
-            rename_map[col] = "low"
-        elif col_lower == "close" or col_lower.startswith("close"):
-            rename_map[col] = "close"
-        elif col_lower.startswith("volume"):
-            rename_map[col] = "volume"
-
-    df.rename(columns=rename_map, inplace=True)
-
-    required = ["timestamp", "open", "high", "low", "close"]
-    if any(col not in df.columns for col in required):
+    if any(col is None for col in [open_col, high_col, low_col, close_col]):
         return pd.DataFrame()
 
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    out = pd.DataFrame({
+        "timestamp": df[timestamp_col],
+        "open": df[open_col],
+        "high": df[high_col],
+        "low": df[low_col],
+        "close": df[close_col],
+        "volume": df[volume_col] if volume_col is not None else 0.0,
+    })
 
-    # Convert Yahoo intraday timestamps to US market time.
-    if getattr(df["timestamp"].dt, "tz", None) is not None:
-        try:
-            df["timestamp"] = (
-                df["timestamp"]
+    out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
+
+    # Convert Yahoo intraday timestamps to New York time if timezone exists.
+    try:
+        if out["timestamp"].dt.tz is not None:
+            out["timestamp"] = (
+                out["timestamp"]
                 .dt.tz_convert("America/New_York")
                 .dt.tz_localize(None)
             )
-        except Exception:
-            df["timestamp"] = df["timestamp"].dt.tz_localize(None)
+    except Exception:
+        pass
 
-    if "volume" not in df.columns:
-        df["volume"] = 0.0
+    for col in ["open", "high", "low", "close", "volume"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
 
-    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+    out["volume"] = out["volume"].fillna(0.0)
 
-    for col in ["open", "high", "low", "close"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    out = out.dropna(subset=["timestamp", "open", "high", "low", "close"])
+    out = out.drop_duplicates(subset=["timestamp"])
+    out = out.sort_values("timestamp").reset_index(drop=True)
 
-    df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
-    df = df.drop_duplicates(subset=["timestamp"])
-    df = df.sort_values("timestamp").reset_index(drop=True)
+    # --------------------------------------------------------
+    # OHLC VALIDATION
+    #
+    # Removes malformed Yahoo bars that can destroy Plotly axes.
+    # Example bad bar:
+    # normal TQQQ price = $65
+    # malformed Yahoo bar = $80,000
+    # --------------------------------------------------------
+    valid = (
+        (out["open"] > 0) &
+        (out["high"] > 0) &
+        (out["low"] > 0) &
+        (out["close"] > 0) &
+        (out["high"] >= out["low"]) &
+        (out["high"] >= out["open"]) &
+        (out["high"] >= out["close"]) &
+        (out["low"] <= out["open"]) &
+        (out["low"] <= out["close"])
+    )
 
-    df["date_only"] = df["timestamp"].dt.date
-    df["label"] = df["timestamp"].dt.strftime("%m-%d %H:%M")
+    out = out[valid].copy()
 
-    return df.reset_index(drop=True)
+    if out.empty:
+        return pd.DataFrame()
+
+    # Remove absurd single-candle ranges.
+    out["bar_ratio"] = out["high"] / out["low"]
+    out = out[out["bar_ratio"] <= 3.0].copy()
+
+    if out.empty:
+        return pd.DataFrame()
+
+    # Robust rolling-median outlier filter.
+    # Intraday price should not suddenly be 10x normal price.
+    rolling_med = (
+        out["close"]
+        .rolling(80, min_periods=10)
+        .median()
+        .shift(1)
+    )
+
+    expanding_med = out["close"].expanding(min_periods=1).median()
+
+    reference = rolling_med.fillna(expanding_med)
+    reference = reference.replace(0, np.nan)
+
+    price_ratio = out["close"] / reference
+
+    if intraday:
+        out = out[
+            (price_ratio >= 0.10) &
+            (price_ratio <= 10.0)
+        ].copy()
+    else:
+        out = out[
+            (price_ratio >= 0.02) &
+            (price_ratio <= 50.0)
+        ].copy()
+
+    if out.empty:
+        return pd.DataFrame()
+
+    out = out.drop(columns=["bar_ratio"], errors="ignore")
+
+    out["date_only"] = out["timestamp"].dt.date
+    out["label"] = out["timestamp"].dt.strftime("%m-%d %H:%M")
+
+    return out.reset_index(drop=True)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_native_history(ticker: str, timeframe: str) -> pd.DataFrame:
+def fetch_native_history(ticker, timeframe):
     """
-    Fetch all currently available native Yahoo history for a timeframe.
+    Fetches Yahoo's currently retained native history.
 
-    This intentionally uses Yahoo's period-based request, rather than asking
-    for a date range that may start too far before Yahoo's intraday cutoff.
+    Important:
+    Uses period-based Yahoo requests.
 
-    For example:
-      5m -> period='60d'
-      1m -> period='7d'
+    Example:
+    5m = period='60d', interval='5m'
 
-    This fixes the issue where a selected practice day 20 days ago caused the
-    app to request 60 days BEFORE that date, which Yahoo can reject entirely.
+    This avoids requesting:
+    selected date - 60 days → selected date
+
+    ...which can fail if the beginning of that requested range is
+    outside Yahoo's current rolling intraday retention window.
     """
-    if timeframe not in TIMEFRAME_CONFIG:
-        return pd.DataFrame()
-
     cfg = TIMEFRAME_CONFIG[timeframe]
 
     periods_to_try = [
@@ -300,7 +366,10 @@ def fetch_native_history(ticker: str, timeframe: str) -> pd.DataFrame:
                 threads=False,
             )
 
-            df = normalize_ohlcv(raw)
+            df = normalize_ohlcv(
+                raw,
+                intraday=cfg["intraday"],
+            )
 
             if not df.empty:
                 return df
@@ -311,71 +380,126 @@ def fetch_native_history(ticker: str, timeframe: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def moving_avg(series: pd.Series, length: int, kind: str = "EMA") -> pd.Series:
+def moving_avg(series, length, kind="EMA"):
     if kind == "EMA":
-        return series.ewm(span=length, adjust=False).mean()
+        return series.ewm(span=int(length), adjust=False).mean()
 
-    return series.rolling(length).mean()
+    return series.rolling(int(length)).mean()
 
 
-def get_day_rows(df: pd.DataFrame, practice_date):
-    if df is None or df.empty:
-        return pd.DataFrame()
-
+def get_day_rows(df, practice_date):
     return df[df["date_only"] == practice_date].copy()
 
 
-def get_context_start_timestamp(
-    revealed_df: pd.DataFrame,
-    practice_date,
-    preset: str,
-):
+def get_context_render_df(revealed_df, practice_date, preset):
     """
-    Context preset affects camera/viewport only.
-    Historical data remains loaded in the chart.
+    Returns only the bars needed for chart rendering.
+
+    EMA calculations are still done separately on all revealed history.
+    This is the major performance improvement.
     """
+
     if revealed_df.empty:
-        return None
+        return revealed_df.copy()
 
     unique_dates = sorted(revealed_df["date_only"].unique())
 
     if practice_date not in unique_dates:
-        return revealed_df["timestamp"].iloc[0]
+        return revealed_df.copy()
 
-    current_idx = unique_dates.index(practice_date)
+    index = unique_dates.index(practice_date)
 
-    previous_map = {
+    previous_days_map = {
         "Today": 0,
         "1 Previous Day": 1,
         "5 Previous Days": 5,
         "20 Previous Days": 20,
-        "All Available History": 10_000,
+        "All Available History": 99999,
     }
 
-    n_previous = previous_map.get(preset, 0)
-    start_idx = max(0, current_idx - n_previous)
-    start_date = unique_dates[start_idx]
+    previous_days = previous_days_map.get(preset, 0)
+    start_index = max(0, index - previous_days)
+    start_date = unique_dates[start_index]
 
-    subset = revealed_df[revealed_df["date_only"] >= start_date]
-    if subset.empty:
-        return revealed_df["timestamp"].iloc[0]
-
-    return subset["timestamp"].iloc[0]
+    return revealed_df[
+        revealed_df["date_only"] >= start_date
+    ].copy()
 
 
-def right_padding_timestamp(timestamp, timeframe: str):
+def get_price_axis_range(df):
+    """
+    Creates a readable y-axis range based only on currently visible data.
+
+    This fixes the problem where candles were tiny/invisible because the
+    y-axis used all historical data instead of the active replay window.
+    """
+
+    if df.empty:
+        return None
+
+    values = []
+
+    for col in ["low", "high", "fast_ma", "slow_ma"]:
+        if col in df.columns:
+            vals = pd.to_numeric(df[col], errors="coerce").dropna().tolist()
+            values.extend(vals)
+
+    if not values:
+        return None
+
+    low = float(min(values))
+    high = float(max(values))
+
+    median_price = float(
+        pd.to_numeric(df["close"], errors="coerce").median()
+    )
+
+    spread = high - low
+
+    # Prevent a single narrow candle from having a zero-height chart.
+    min_spread = max(median_price * 0.003, 0.10)
+    spread = max(spread, min_spread)
+
+    padding = max(spread * 0.12, median_price * 0.001)
+
+    return [
+        low - padding,
+        high + padding,
+    ]
+
+
+def get_volume_axis_range(df):
+    """Volume axis based only on visible context/current window."""
+
+    if df.empty or df["volume"].max() <= 0:
+        return None
+
+    volume_values = df["volume"].dropna()
+
+    cap = max(
+        float(volume_values.quantile(0.95)) * 1.15,
+        float(volume_values.median()) * 2.0,
+        1.0,
+    )
+
+    return [0, cap]
+
+
+def right_padding_timestamp(timestamp, timeframe):
     cfg = TIMEFRAME_CONFIG[timeframe]
 
     if cfg["intraday"]:
-        return timestamp + pd.Timedelta(minutes=cfg["step_minutes"] * 3)
+        return pd.Timestamp(timestamp) + pd.Timedelta(
+            minutes=cfg["minutes"] * 3
+        )
 
-    return timestamp + pd.Timedelta(days=5)
+    return pd.Timestamp(timestamp) + pd.Timedelta(days=5)
 
 
 # ============================================================
-# STRUCTURE FUNCTIONS
+# MARKET STRUCTURE FUNCTIONS
 # ============================================================
-def _raw_swings(df: pd.DataFrame):
+def _raw_swings(df):
     if df is None or len(df) < SWING_K * 2 + 1:
         return []
 
@@ -383,8 +507,8 @@ def _raw_swings(df: pd.DataFrame):
     lows = df["low"].values
     n = len(df)
 
-    ref_price = float(df["close"].iloc[-1])
-    min_size = max(ref_price * MIN_SWING_PCT, 1e-9)
+    reference = float(df["close"].iloc[-1])
+    min_size = max(reference * MIN_SWING_PCT, 1e-9)
 
     raw = []
 
@@ -406,27 +530,37 @@ def _raw_swings(df: pd.DataFrame):
 
     for swing in raw:
         if cleaned and cleaned[-1][2] == swing[2]:
-            last = cleaned[-1]
+            previous = cleaned[-1]
 
-            if swing[2] == "H" and swing[1] >= last[1]:
+            if swing[2] == "H" and swing[1] >= previous[1]:
                 cleaned[-1] = swing
 
-            elif swing[2] == "L" and swing[1] <= last[1]:
+            elif swing[2] == "L" and swing[1] <= previous[1]:
                 cleaned[-1] = swing
+
         else:
             cleaned.append(swing)
 
     labeled = []
-    last_high = None
-    last_low = None
+    previous_high = None
+    previous_low = None
 
     for idx, price, swing_type in cleaned:
         if swing_type == "H":
-            label = "H" if last_high is None else ("HH" if price > last_high else "LH")
-            last_high = price
+            label = (
+                "H"
+                if previous_high is None
+                else ("HH" if price > previous_high else "LH")
+            )
+            previous_high = price
+
         else:
-            label = "L" if last_low is None else ("HL" if price > last_low else "LL")
-            last_low = price
+            label = (
+                "L"
+                if previous_low is None
+                else ("HL" if price > previous_low else "LL")
+            )
+            previous_low = price
 
         labeled.append({
             "i": idx,
@@ -445,7 +579,10 @@ def build_zones(labeled, reference_price):
         placed = False
 
         for zone in zones:
-            if abs(swing["price"] - zone["mid"]) / max(reference_price, 1e-9) < ZONE_TOL:
+            distance = abs(swing["price"] - zone["mid"])
+            normalized_distance = distance / max(reference_price, 1e-9)
+
+            if normalized_distance < ZONE_TOL:
                 zone["prices"].append(swing["price"])
                 zone["mid"] = float(np.mean(zone["prices"]))
                 zone["touches"] += 1
@@ -467,7 +604,10 @@ def build_zones(labeled, reference_price):
                 "high_touches": 1 if swing["type"] == "H" else 0,
             })
 
-    output = [zone for zone in zones if zone["touches"] >= MIN_DRAW_TOUCHES]
+    output = [
+        zone for zone in zones
+        if zone["touches"] >= MIN_DRAW_TOUCHES
+    ]
 
     for zone in output:
         zone["min_px"] = min(zone["prices"])
@@ -476,12 +616,11 @@ def build_zones(labeled, reference_price):
     return output
 
 
-def detect_bos_choch(df: pd.DataFrame, labeled):
+def detect_bos_choch(df, labeled):
     """
-    BOS = continuation in the existing direction.
-    CHoCH = break against existing direction / change warning.
+    BOS = continuation in active direction.
+    CHoCH = break against active direction / potential reversal.
     """
-    n = len(df)
 
     bos = []
     choch = []
@@ -494,16 +633,22 @@ def detect_bos_choch(df: pd.DataFrame, labeled):
     bias = "NEUTRAL"
     pointer = 0
 
-    for i in range(n):
-        while pointer < len(labeled) and labeled[pointer]["i"] + SWING_K <= i:
+    for i in range(len(df)):
+        while (
+            pointer < len(labeled) and
+            labeled[pointer]["i"] + SWING_K <= i
+        ):
             swing = labeled[pointer]
 
             if swing["label"] == "HH":
                 last_hh = swing["price"]
+
             elif swing["label"] == "HL":
                 last_hl = swing["price"]
+
             elif swing["label"] == "LH":
                 last_lh = swing["price"]
+
             elif swing["label"] == "LL":
                 last_ll = swing["price"]
 
@@ -511,7 +656,6 @@ def detect_bos_choch(df: pd.DataFrame, labeled):
 
         close = float(df["close"].iloc[i])
 
-        # Bullish BOS: break above confirmed HH.
         if last_hh is not None and close > last_hh:
             if bias != "BULL":
                 bos.append({
@@ -524,7 +668,6 @@ def detect_bos_choch(df: pd.DataFrame, labeled):
             last_hh = None
             continue
 
-        # Bearish BOS: break below confirmed LL.
         if last_ll is not None and close < last_ll:
             if bias != "BEAR":
                 bos.append({
@@ -538,23 +681,23 @@ def detect_bos_choch(df: pd.DataFrame, labeled):
             continue
 
         if CHOCH_ENABLE:
-            # Bull trend loses HL -> CHoCH down.
             if bias == "BULL" and last_hl is not None and close < last_hl:
                 choch.append({
                     "i": i,
                     "price": last_hl,
                     "dir": "down",
                 })
+
                 last_hl = None
                 bias = "NEUTRAL"
 
-            # Bear trend breaks LH -> CHoCH up.
             elif bias == "BEAR" and last_lh is not None and close > last_lh:
                 choch.append({
                     "i": i,
                     "price": last_lh,
                     "dir": "up",
                 })
+
                 last_lh = None
                 bias = "NEUTRAL"
 
@@ -578,6 +721,26 @@ def zone_role(zone, close, noise):
         return "broken_ceiling"
 
     return role
+
+
+def select_relevant_zones(zones, current_price):
+    """
+    Shows only nearby/important zones.
+    Prevents hundreds of horizontal lines from being drawn.
+    """
+
+    if not zones:
+        return []
+
+    ranked = sorted(
+        zones,
+        key=lambda zone: (
+            abs(zone["mid"] - current_price),
+            -zone["touches"],
+        ),
+    )
+
+    return ranked[:MAX_ZONES_DRAWN]
 
 
 def badge(fig, x, y, text, palette, yshift=0, arrow=False):
@@ -608,7 +771,7 @@ def badge(fig, x, y, text, palette, yshift=0, arrow=False):
 
 
 # ============================================================
-# PAPER TRADING FUNCTIONS
+# TRADING FUNCTIONS
 # ============================================================
 def add_marker(timestamp, price, kind):
     st.session_state.markers.append({
@@ -619,14 +782,14 @@ def add_marker(timestamp, price, kind):
 
 
 def close_position(qty, price, timestamp, reason=""):
-    pos = st.session_state.shares
+    pos = float(st.session_state.shares)
     timestamp = pd.Timestamp(timestamp)
     time_text = timestamp.strftime("%Y-%m-%d %H:%M")
 
     if pos > 0:
-        qty = min(float(qty), float(pos))
+        qty = min(float(qty), pos)
 
-        st.session_state.balance += qty * price
+        st.session_state.balance += qty * float(price)
         st.session_state.shares -= qty
 
         st.session_state.trade_log.append(
@@ -636,9 +799,9 @@ def close_position(qty, price, timestamp, reason=""):
         add_marker(timestamp, price, "SELL")
 
     elif pos < 0:
-        qty = min(float(qty), float(abs(pos)))
+        qty = min(float(qty), abs(pos))
 
-        st.session_state.balance -= qty * price
+        st.session_state.balance -= qty * float(price)
         st.session_state.shares += qty
 
         st.session_state.trade_log.append(
@@ -647,22 +810,27 @@ def close_position(qty, price, timestamp, reason=""):
 
         add_marker(timestamp, price, "COVER")
 
-    if abs(st.session_state.shares) < 1e-10:
+    if abs(float(st.session_state.shares)) < 1e-10:
         st.session_state.shares = 0.0
         st.session_state.stop_loss = None
         st.session_state.target = None
         st.session_state.entry_price = None
 
 
-def advance_bars(number_of_bars: int):
+def advance_bars(number_of_bars):
     """
-    Advance by native timeframe bars.
+    Advances native bars.
 
-    Note:
-    For native 5m/15m/etc bars, if both SL and TP occur inside the same
-    OHLC candle, this simulator assumes stop-loss happens first.
-    That is conservative.
+    Example:
+    On 5m:
+      +5m = one native 5-minute candle.
+      +15m = three native 5-minute candles.
+
+    Stop/target checks use OHLC of the selected native timeframe.
+    If stop and target are touched inside the same larger candle,
+    this simulator conservatively assumes stop happens first.
     """
+
     df = st.session_state.df
     max_step = len(df) - 1
 
@@ -676,7 +844,7 @@ def advance_bars(number_of_bars: int):
         row = df.iloc[st.session_state.step]
         timestamp = row["timestamp"]
 
-        pos = st.session_state.shares
+        pos = float(st.session_state.shares)
         sl = st.session_state.stop_loss
         tp = st.session_state.target
 
@@ -759,7 +927,7 @@ def add_horizontal_line(price, label="", color="#22d3ee"):
     })
 
 
-def add_band(price_1, price_2, color="rgba(34,197,94,0.18)"):
+def add_band(price_1, price_2):
     y0 = min(float(price_1), float(price_2))
     y1 = max(float(price_1), float(price_2))
 
@@ -767,116 +935,109 @@ def add_band(price_1, price_2, color="rgba(34,197,94,0.18)"):
         "type": "band",
         "y0": y0,
         "y1": y1,
-        "color": color,
+        "color": "rgba(34,197,94,0.18)",
         "label": f"Band {y0:.2f}-{y1:.2f}",
     })
 
 
-def add_trend_line(x0, y0, x1, y1, color="#f472b6"):
+def add_trend_line(x0, y0, x1, y1):
     st.session_state.drawings.append({
         "type": "trend",
         "x0": pd.Timestamp(x0),
         "y0": float(y0),
         "x1": pd.Timestamp(x1),
         "y1": float(y1),
-        "color": color,
+        "color": "#f472b6",
         "label": "Trend line",
     })
 
 
 def extract_selected_points(chart_event):
-    """
-    Supports current Streamlit Plotly selection object and dict fallback.
-    """
     if chart_event is None:
         return []
 
     try:
-        selection = chart_event.selection
-        if selection is not None:
-            return list(selection.points)
+        return [dict(point) for point in chart_event.selection.points]
     except Exception:
         pass
 
     try:
-        selection = chart_event.get("selection", {})
-        return selection.get("points", [])
+        return chart_event.get("selection", {}).get("points", [])
     except Exception:
         return []
 
 
-def nearest_row_from_event(df: pd.DataFrame, point: dict):
-    """
-    Resolve a Plotly selected point to a candle row.
-    """
+def nearest_row_from_event(df, point):
     if df.empty:
         return None
-
-    point_index = point.get("point_index", point.get("pointIndex"))
-
-    if point_index is not None:
-        try:
-            point_index = int(point_index)
-
-            if 0 <= point_index < len(df):
-                return df.iloc[point_index]
-        except Exception:
-            pass
 
     x_value = point.get("x")
 
     if x_value is not None:
         try:
             clicked_time = pd.to_datetime(x_value)
-            index = (df["timestamp"] - clicked_time).abs().idxmin()
-            return df.loc[index]
+            nearest_idx = (df["timestamp"] - clicked_time).abs().idxmin()
+            return df.loc[nearest_idx]
+        except Exception:
+            pass
+
+    point_index = point.get("point_index", point.get("pointIndex"))
+
+    if point_index is not None:
+        try:
+            idx = int(point_index)
+
+            if 0 <= idx < len(df):
+                return df.iloc[idx]
         except Exception:
             pass
 
     return df.iloc[-1]
 
 
-def process_drawing_click(mode: str, row: pd.Series, clicked_y=None):
+def process_drawing_click(mode, row, clicked_y=None):
     if row is None or mode == "None":
         return
 
     timestamp = row["timestamp"]
 
-    # For Band / Trend line, prefer click y-value if available.
-    if clicked_y is None:
+    try:
+        anchor_price = float(clicked_y)
+    except Exception:
         anchor_price = float(row["close"])
-    else:
-        try:
-            anchor_price = float(clicked_y)
-        except Exception:
-            anchor_price = float(row["close"])
 
     if mode == "Line at High":
         price = float(row["high"])
+
         add_horizontal_line(
             price,
             label=f"H {price:.2f}",
             color="#ef4444",
         )
-        st.toast(f"Resistance line added: {price:.2f}", icon="📌")
+
+        st.toast(f"High line added at {price:.2f}", icon="📌")
 
     elif mode == "Line at Close":
         price = float(row["close"])
+
         add_horizontal_line(
             price,
             label=f"C {price:.2f}",
             color="#22d3ee",
         )
-        st.toast(f"Close line added: {price:.2f}", icon="📌")
+
+        st.toast(f"Close line added at {price:.2f}", icon="📌")
 
     elif mode == "Line at Low":
         price = float(row["low"])
+
         add_horizontal_line(
             price,
             label=f"L {price:.2f}",
             color="#22c55e",
         )
-        st.toast(f"Support line added: {price:.2f}", icon="📌")
+
+        st.toast(f"Low line added at {price:.2f}", icon="📌")
 
     elif mode == "Band":
         st.session_state.draw_clicks.append({
@@ -885,16 +1046,17 @@ def process_drawing_click(mode: str, row: pd.Series, clicked_y=None):
         })
 
         if len(st.session_state.draw_clicks) == 1:
-            st.toast("Band: first point saved. Click a second point.", icon="🖱️")
+            st.toast("Band point one saved. Click second point.", icon="🖱️")
 
         elif len(st.session_state.draw_clicks) >= 2:
-            first = st.session_state.draw_clicks[0]
-            second = st.session_state.draw_clicks[1]
+            p1 = st.session_state.draw_clicks[0]["price"]
+            p2 = st.session_state.draw_clicks[1]["price"]
 
-            add_band(first["price"], second["price"])
+            add_band(p1, p2)
+
             st.session_state.draw_clicks = []
 
-            st.toast("Price band added.", icon="🟩")
+            st.toast("Band added.", icon="🟩")
 
     elif mode == "Trend line":
         st.session_state.draw_clicks.append({
@@ -903,7 +1065,7 @@ def process_drawing_click(mode: str, row: pd.Series, clicked_y=None):
         })
 
         if len(st.session_state.draw_clicks) == 1:
-            st.toast("Trend line: first point saved. Click second point.", icon="🖱️")
+            st.toast("Trend point one saved. Click second point.", icon="🖱️")
 
         elif len(st.session_state.draw_clicks) >= 2:
             first = st.session_state.draw_clicks[0]
@@ -926,7 +1088,10 @@ def process_drawing_click(mode: str, row: pd.Series, clicked_y=None):
 # ============================================================
 st.sidebar.header("⚙️ Setup")
 
-ticker = st.sidebar.text_input("Ticker", value="TQQQ").upper().strip()
+ticker = st.sidebar.text_input(
+    "Ticker",
+    value="TQQQ",
+).upper().strip()
 
 timeframe = st.sidebar.selectbox(
     "Chart Timeframe (native)",
@@ -938,14 +1103,11 @@ timeframe_cfg = TIMEFRAME_CONFIG[timeframe]
 
 st.sidebar.caption(
     f"Yahoo native `{timeframe}` data. "
-    f"Fetching rolling period: `{timeframe_cfg['period']}`."
+    f"Rolling request: `{timeframe_cfg['period']}`."
 )
 
 # ------------------------------------------------------------
-# Fetch preview data FIRST.
-#
-# This is the key fix:
-# The date picker is driven by the actual dates Yahoo returns.
+# DATA PREVIEW
 # ------------------------------------------------------------
 source_df = pd.DataFrame()
 practice_date = None
@@ -963,26 +1125,25 @@ if source_df.empty:
         "Possible causes:\n"
         "- Yahoo temporary rate limit\n"
         "- invalid ticker\n"
-        "- market/provider outage\n"
-        "- timeframe history unavailable"
+        "- Yahoo outage\n"
+        "- timeframe unavailable"
     )
+
 else:
     available_dates = sorted(source_df["date_only"].unique())
 
-    first_available = available_dates[0]
-    last_available = available_dates[-1]
+    first_date = available_dates[0]
+    last_date = available_dates[-1]
 
     st.sidebar.success(
         f"{len(source_df):,} native bars\n"
-        f"{first_available} → {last_available}"
+        f"{first_date} → {last_date}"
     )
 
     st.sidebar.caption(
-        "The practice-date picker below uses dates actually returned "
-        "by Yahoo for this timeframe."
+        "Practice dates below are based on dates Yahoo actually returned."
     )
 
-    # Default to third-most recent trading day where possible.
     if len(available_dates) >= 3:
         default_practice_date = available_dates[-3]
     else:
@@ -991,49 +1152,51 @@ else:
     practice_date_key = f"practice_date_{ticker}_{timeframe}"
 
     if (
-        practice_date_key not in st.session_state
-        or st.session_state[practice_date_key] not in available_dates
+        practice_date_key not in st.session_state or
+        st.session_state[practice_date_key] not in available_dates
     ):
         st.session_state[practice_date_key] = default_practice_date
 
     practice_date = st.sidebar.date_input(
         "Practice Date",
-        min_value=first_available,
-        max_value=last_available,
+        min_value=first_date,
+        max_value=last_date,
         key=practice_date_key,
     )
 
-    practice_day_rows = get_day_rows(source_df, practice_date)
+    practice_rows = get_day_rows(source_df, practice_date)
 
-    if practice_day_rows.empty:
+    if practice_rows.empty:
         st.sidebar.warning(
-            "No market bars for this selected date. "
-            "It may be a weekend, holiday, or unavailable session."
+            "No market bars on this date. It may be a holiday/weekend."
         )
+
     else:
         if timeframe_cfg["intraday"]:
-            start_labels = practice_day_rows["timestamp"].dt.strftime("%H:%M").tolist()
+            start_labels = practice_rows["timestamp"].dt.strftime(
+                "%H:%M"
+            ).tolist()
 
-            default_start_idx = min(10, len(start_labels) - 1)
+            default_index = min(10, len(start_labels) - 1)
 
-            start_time_key = f"start_time_{ticker}_{timeframe}_{practice_date}"
+            start_time_key = (
+                f"start_time_{ticker}_{timeframe}_{practice_date}"
+            )
 
             selected_start_label = st.sidebar.selectbox(
                 "Replay Start Time",
                 start_labels,
-                index=default_start_idx,
+                index=default_index,
                 key=start_time_key,
             )
 
-            selected_start_timestamp = practice_day_rows[
-                practice_day_rows["timestamp"].dt.strftime("%H:%M") == selected_start_label
+            selected_start_timestamp = practice_rows[
+                practice_rows["timestamp"].dt.strftime("%H:%M") ==
+                selected_start_label
             ]["timestamp"].iloc[0]
 
         else:
-            selected_start_timestamp = practice_day_rows["timestamp"].iloc[0]
-            st.sidebar.caption(
-                f"Daily replay begins at: {selected_start_timestamp.strftime('%Y-%m-%d')}"
-            )
+            selected_start_timestamp = practice_rows["timestamp"].iloc[0]
 
         can_start = True
 
@@ -1043,7 +1206,10 @@ else:
 st.sidebar.markdown("---")
 st.sidebar.subheader("📈 Moving Averages")
 
-show_ma = st.sidebar.checkbox("Show Moving Averages", value=True)
+show_ma = st.sidebar.checkbox(
+    "Show Moving Averages",
+    value=True,
+)
 
 ma_type = st.sidebar.radio(
     "MA Type",
@@ -1071,7 +1237,10 @@ slow_len = st.sidebar.number_input(
     key=f"slow_ma_{timeframe}",
 )
 
-show_vol_ma = st.sidebar.checkbox("Show Volume MA", value=True)
+show_vol_ma = st.sidebar.checkbox(
+    "Show Volume MA",
+    value=True,
+)
 
 vol_ma_len = st.sidebar.number_input(
     "Volume MA Length",
@@ -1079,11 +1248,6 @@ vol_ma_len = st.sidebar.number_input(
     max_value=200,
     value=20,
     step=1,
-)
-
-st.sidebar.caption(
-    f"Active: {ma_type}{int(fast_len)} and {ma_type}{int(slow_len)} "
-    f"on native {timeframe} candles."
 )
 
 # ------------------------------------------------------------
@@ -1094,16 +1258,16 @@ st.sidebar.subheader("🏗️ Structure")
 
 show_struct = st.sidebar.checkbox(
     "Show structure labels",
-    value=True,
+    value=False,  # Default OFF for performance/readability.
 )
 
 show_zones = st.sidebar.checkbox(
     "Show S/R zones",
-    value=True,
+    value=False,  # Default OFF for performance/readability.
 )
 
 # ------------------------------------------------------------
-# CONTEXT / CAMERA SETTINGS
+# CONTEXT SETTINGS
 # ------------------------------------------------------------
 st.sidebar.markdown("---")
 st.sidebar.subheader("📷 Chart Context")
@@ -1120,8 +1284,8 @@ follow_replay = st.sidebar.checkbox(
 )
 
 st.sidebar.caption(
-    "Follow ON: every advance returns the camera to the replay day.\n\n"
-    "Follow OFF: you can remain zoomed/panned on old levels."
+    "Follow ON: after advancing, the chart returns to current replay candles.\n\n"
+    "Follow OFF: zoom/pan stays where you left it."
 )
 
 # ------------------------------------------------------------
@@ -1136,9 +1300,9 @@ draw_mode = st.sidebar.selectbox(
     index=0,
 )
 
-if st.session_state.last_draw_mode != draw_mode:
+if draw_mode != st.session_state.last_draw_mode:
     st.session_state.last_draw_mode = draw_mode
-    st.session_state.last_draw_event = None
+    st.session_state.last_draw_signature = None
     st.session_state.draw_clicks = []
 
 if st.session_state.draw_clicks:
@@ -1154,7 +1318,7 @@ if st.sidebar.button("Undo last drawing"):
 if st.sidebar.button("Clear all drawings"):
     st.session_state.drawings = []
     st.session_state.draw_clicks = []
-    st.session_state.last_draw_event = None
+    st.session_state.last_draw_signature = None
     st.toast("All drawings cleared.", icon="🧹")
 
 # ------------------------------------------------------------
@@ -1167,11 +1331,13 @@ if st.sidebar.button(
     use_container_width=True,
     disabled=not can_start,
 ):
+    # Keep only history before or on selected practice day.
+    # This prevents future-day leakage.
     active_df = source_df[
         source_df["date_only"] <= practice_date
     ].copy().reset_index(drop=True)
 
-    selected_indices = active_df.index[
+    selected_index_list = active_df.index[
         active_df["timestamp"] == selected_start_timestamp
     ].tolist()
 
@@ -1179,14 +1345,12 @@ if st.sidebar.button(
         active_df["date_only"] == practice_date
     ].tolist()
 
-    if not day_indices or not selected_indices:
-        st.sidebar.error(
-            "Could not initialize replay for this date/time."
-        )
+    if not selected_index_list or not day_indices:
+        st.sidebar.error("Could not initialize the replay.")
     else:
         st.session_state.df = active_df
         st.session_state.sim_start_idx = day_indices[0]
-        st.session_state.step = selected_indices[0]
+        st.session_state.step = selected_index_list[0]
 
         st.session_state.balance = 1000.0
         st.session_state.shares = 0.0
@@ -1199,7 +1363,7 @@ if st.sidebar.button(
 
         st.session_state.drawings = []
         st.session_state.draw_clicks = []
-        st.session_state.last_draw_event = None
+        st.session_state.last_draw_signature = None
 
         st.session_state.active_ticker = ticker
         st.session_state.active_interval = timeframe
@@ -1213,7 +1377,6 @@ if st.sidebar.button(
 
         st.rerun()
 
-
 # ============================================================
 # MAIN APP
 # ============================================================
@@ -1224,34 +1387,37 @@ st.caption(
 
 if not st.session_state.sim_active or st.session_state.df.empty:
     st.info(
-        "Pick a ticker, native timeframe, valid practice date, and replay "
-        "start time. Then click **Start / Reset Simulation**."
+        "Choose ticker, native timeframe, practice date, and start time. "
+        "Then click **Start / Reset Simulation**."
     )
     st.stop()
 
-# Warn if user changed sidebar values while replay is active.
+# Alert if user changes settings without pressing reset.
 if (
-    st.session_state.active_ticker != ticker
-    or st.session_state.active_interval != timeframe
-    or st.session_state.active_practice_date != practice_date
+    st.session_state.active_ticker != ticker or
+    st.session_state.active_interval != timeframe or
+    st.session_state.active_practice_date != practice_date
 ):
     st.warning(
-        "Sidebar ticker/timeframe/date differs from the active replay. "
-        "Click **Start / Reset Simulation** to apply the new selection."
+        "Sidebar ticker/timeframe/date differs from active replay. "
+        "Click **Start / Reset Simulation** to apply changes."
     )
 
 df_all = st.session_state.df
 step = st.session_state.step
 practice_day = st.session_state.active_practice_date
-active_interval = st.session_state.active_interval
 active_ticker = st.session_state.active_ticker
+active_interval = st.session_state.active_interval
 
-# Historical days are fully available.
-# Current replay day is visible only up to current step.
+# ------------------------------------------------------------
+# Revealed data:
+# - all previous dates fully available
+# - current replay day only up to current bar
+# ------------------------------------------------------------
 revealed_df = df_all.iloc[:step + 1].copy()
 
 if revealed_df.empty:
-    st.error("No revealed data available.")
+    st.error("No revealed bars available.")
     st.stop()
 
 current_row = df_all.iloc[step]
@@ -1259,26 +1425,69 @@ current_price = float(current_row["close"])
 current_timestamp = pd.Timestamp(current_row["timestamp"])
 current_time_text = current_timestamp.strftime("%Y-%m-%d %H:%M")
 
+# ------------------------------------------------------------
+# EMA CALCULATION DATA:
+# Uses ALL revealed historical bars.
+# ------------------------------------------------------------
+calc_df = revealed_df.copy()
+
+if show_ma:
+    calc_df["fast_ma"] = moving_avg(
+        calc_df["close"],
+        fast_len,
+        ma_type,
+    )
+
+    calc_df["slow_ma"] = moving_avg(
+        calc_df["close"],
+        slow_len,
+        ma_type,
+    )
+
+if show_vol_ma:
+    calc_df["vol_ma"] = calc_df["volume"].rolling(
+        int(vol_ma_len)
+    ).mean()
+
+# ------------------------------------------------------------
+# RENDERED DATA:
+# Only selected context bars are sent to Plotly.
+# This fixes speed/performance.
+# ------------------------------------------------------------
+chart_df = get_context_render_df(
+    calc_df,
+    practice_day,
+    context_preset,
+).reset_index(drop=True)
+
+if chart_df.empty:
+    chart_df = calc_df.copy().reset_index(drop=True)
+
+# ------------------------------------------------------------
+# POSITION / ACCOUNT
+# ------------------------------------------------------------
 pos = float(st.session_state.shares)
 position_value = pos * current_price
-equity = st.session_state.balance + position_value
+equity = float(st.session_state.balance) + position_value
 pnl = equity - 1000.0
 
-pnl_color = "normal" if pnl == 0 else ("inverse" if pnl > 0 else "off")
+pnl_color = "normal" if pnl == 0 else (
+    "inverse" if pnl > 0 else "off"
+)
 
 if pos > 0:
-    pos_text = f"{pos:.4f} sh"
     pos_type = "🟢 LONG"
+    pos_text = f"{pos:.4f} sh"
 elif pos < 0:
-    pos_text = f"{abs(pos):.4f} sh"
     pos_type = "🔴 SHORT"
+    pos_text = f"{abs(pos):.4f} sh"
 else:
-    pos_text = "—"
     pos_type = "FLAT"
+    pos_text = "—"
 
-# ============================================================
-# CAMERA STATE
-# ============================================================
+# ------------------------------------------------------------
+# CAMERA
+# ------------------------------------------------------------
 camera_signature = (
     context_preset,
     follow_replay,
@@ -1291,12 +1500,11 @@ if st.session_state.camera_signature != camera_signature:
     st.session_state.camera_revision += 1
     st.session_state.force_camera = True
 
-# Follow ON always resets camera toward current replay day.
 apply_camera = follow_replay or st.session_state.force_camera
 
-# ============================================================
+# ------------------------------------------------------------
 # METRICS
-# ============================================================
+# ------------------------------------------------------------
 m1, m2, m3, m4, m5, m6 = st.columns(6)
 
 m1.metric("Price", f"${current_price:.2f}")
@@ -1306,30 +1514,34 @@ m3.metric("Cash", f"${st.session_state.balance:.2f}")
 m4.metric(
     f"Position ({pos_type})",
     pos_text,
-    f"Entry ${st.session_state.entry_price:.2f}"
-    if st.session_state.entry_price is not None
-    else "",
+    (
+        f"Entry ${st.session_state.entry_price:.2f}"
+        if st.session_state.entry_price is not None
+        else ""
+    ),
 )
 
 m5.metric(
     "Stop-Loss",
-    f"${st.session_state.stop_loss:.2f}"
-    if st.session_state.stop_loss is not None
-    else "None",
+    (
+        f"${st.session_state.stop_loss:.2f}"
+        if st.session_state.stop_loss is not None
+        else "None"
+    ),
 )
 
 m6.metric(
     "Target",
-    f"${st.session_state.target:.2f}"
-    if st.session_state.target is not None
-    else "None",
+    (
+        f"${st.session_state.target:.2f}"
+        if st.session_state.target is not None
+        else "None"
+    ),
 )
 
 # ============================================================
 # BUILD CHART
 # ============================================================
-chart_df = revealed_df.copy()
-
 vol_colors = np.where(
     chart_df["close"] >= chart_df["open"],
     "rgba(38,166,154,0.58)",
@@ -1344,7 +1556,7 @@ fig = make_subplots(
     row_heights=[0.78, 0.22],
 )
 
-# Candles
+# Candlestick trace
 fig.add_trace(
     go.Candlestick(
         x=chart_df["timestamp"],
@@ -1366,7 +1578,7 @@ fig.add_trace(
     col=1,
 )
 
-# Volume
+# Volume trace
 fig.add_trace(
     go.Bar(
         x=chart_df["timestamp"],
@@ -1378,26 +1590,8 @@ fig.add_trace(
     col=1,
 )
 
-# ------------------------------------------------------------
-# EMA / SMA
-#
-# Important:
-# Uses ALL revealed history:
-# previous available days + current day only up to replay bar.
-# ------------------------------------------------------------
-if show_ma and len(chart_df) >= 2:
-    chart_df["fast_ma"] = moving_avg(
-        chart_df["close"],
-        int(fast_len),
-        ma_type,
-    )
-
-    chart_df["slow_ma"] = moving_avg(
-        chart_df["close"],
-        int(slow_len),
-        ma_type,
-    )
-
+# EMA traces
+if show_ma and "fast_ma" in chart_df.columns:
     fig.add_trace(
         go.Scatter(
             x=chart_df["timestamp"],
@@ -1420,12 +1614,8 @@ if show_ma and len(chart_df) >= 2:
         col=1,
     )
 
-# Volume MA
-if show_vol_ma and len(chart_df) >= 2:
-    chart_df["vol_ma"] = chart_df["volume"].rolling(
-        int(vol_ma_len)
-    ).mean()
-
+# Volume MA trace
+if show_vol_ma and "vol_ma" in chart_df.columns:
     fig.add_trace(
         go.Scatter(
             x=chart_df["timestamp"],
@@ -1438,29 +1628,34 @@ if show_vol_ma and len(chart_df) >= 2:
     )
 
 # ============================================================
-# STRUCTURE AND ZONES
+# STRUCTURE / ZONES
+#
+# Uses a LIMITED recent section of rendered bars.
+# This prevents lag and annotation overload.
 # ============================================================
-noise = float(
-    (chart_df["high"] - chart_df["low"]).tail(20).mean() or 0.01
-)
-
-labeled = []
-confirmed_swings = []
-
 if show_struct or show_zones:
-    labeled = _raw_swings(chart_df)
+    structure_df = chart_df.tail(MAX_STRUCTURE_BARS).copy().reset_index(drop=True)
+
+    labeled = _raw_swings(structure_df)
 
     confirmed_swings = [
         swing
         for swing in labeled
-        if swing["i"] + SWING_K <= len(chart_df) - 1
+        if swing["i"] + SWING_K <= len(structure_df) - 1
     ]
+else:
+    structure_df = pd.DataFrame()
+    labeled = []
+    confirmed_swings = []
 
-if show_struct and len(chart_df) > SWING_K * 2 + 1:
-    bos, choch = detect_bos_choch(chart_df, labeled)
+if show_struct and not structure_df.empty:
+    bos, choch = detect_bos_choch(structure_df, labeled)
 
-    for swing in confirmed_swings:
-        x = chart_df["timestamp"].iloc[swing["i"]]
+    # Only draw latest swing labels.
+    swings_to_draw = confirmed_swings[-MAX_SWING_LABELS:]
+
+    for swing in swings_to_draw:
+        x = structure_df["timestamp"].iloc[swing["i"]]
 
         if swing["label"] in ("HH", "HL"):
             palette = C_HH
@@ -1483,17 +1678,17 @@ if show_struct and len(chart_df) > SWING_K * 2 + 1:
             yshift=yshift,
         )
 
-    for event in bos:
+    for event in bos[-MAX_BOS_LABELS:]:
         i = event["i"]
 
-        if 0 <= i < len(chart_df):
-            x = chart_df["timestamp"].iloc[i]
+        if 0 <= i < len(structure_df):
+            x = structure_df["timestamp"].iloc[i]
 
             if event["dir"] == "up":
                 badge(
                     fig,
                     x,
-                    float(chart_df["high"].iloc[i]),
+                    float(structure_df["high"].iloc[i]),
                     "BOS↑",
                     C_BOS_UP,
                     yshift=22,
@@ -1503,24 +1698,24 @@ if show_struct and len(chart_df) > SWING_K * 2 + 1:
                 badge(
                     fig,
                     x,
-                    float(chart_df["low"].iloc[i]),
+                    float(structure_df["low"].iloc[i]),
                     "BOS↓",
                     C_BOS_DN,
                     yshift=-22,
                     arrow=True,
                 )
 
-    for event in choch:
+    for event in choch[-MAX_CHOCH_LABELS:]:
         i = event["i"]
 
-        if 0 <= i < len(chart_df):
-            x = chart_df["timestamp"].iloc[i]
+        if 0 <= i < len(structure_df):
+            x = structure_df["timestamp"].iloc[i]
 
             if event["dir"] == "up":
                 badge(
                     fig,
                     x,
-                    float(chart_df["high"].iloc[i]),
+                    float(structure_df["high"].iloc[i]),
                     "CHoCH↑",
                     C_CH_UP,
                     yshift=22,
@@ -1530,7 +1725,7 @@ if show_struct and len(chart_df) > SWING_K * 2 + 1:
                 badge(
                     fig,
                     x,
-                    float(chart_df["low"].iloc[i]),
+                    float(structure_df["low"].iloc[i]),
                     "CHoCH↓",
                     C_CH_DN,
                     yshift=-22,
@@ -1538,8 +1733,21 @@ if show_struct and len(chart_df) > SWING_K * 2 + 1:
                 )
 
 if show_zones and confirmed_swings:
-    zones = build_zones(confirmed_swings, current_price)
-    last_time = chart_df["timestamp"].iloc[-1]
+    noise = float(
+        (structure_df["high"] - structure_df["low"])
+        .tail(20)
+        .mean()
+        or 0.01
+    )
+
+    zones = build_zones(
+        confirmed_swings[-MAX_ZONE_SWINGS:],
+        current_price,
+    )
+
+    zones = select_relevant_zones(zones, current_price)
+
+    right_x = chart_df["timestamp"].iloc[-1]
 
     for zone in zones:
         role = zone_role(zone, current_price, noise)
@@ -1572,7 +1780,7 @@ if show_zones and confirmed_swings:
         )
 
         fig.add_annotation(
-            x=last_time,
+            x=right_x,
             y=zone["mid"],
             row=1,
             col=1,
@@ -1628,7 +1836,7 @@ if pos != 0:
             col=1,
             line=dict(
                 color="#22d3ee",
-                width=1.4,
+                width=1.3,
                 dash="dot",
             ),
         )
@@ -1636,7 +1844,7 @@ if pos != 0:
 # ============================================================
 # TRADE MARKERS
 # ============================================================
-marker_map = {
+marker_styles = {
     "LONG": {"symbol": "triangle-up", "color": "#22c55e"},
     "SHORT": {"symbol": "triangle-down", "color": "#ef4444"},
     "SELL": {"symbol": "circle", "color": "#f97316"},
@@ -1647,7 +1855,7 @@ for marker in st.session_state.markers:
     if marker["timestamp"] > current_timestamp:
         continue
 
-    style = marker_map.get(
+    style = marker_styles.get(
         marker["kind"],
         {"symbol": "circle", "color": "#ffffff"},
     )
@@ -1719,7 +1927,6 @@ for drawing in st.session_state.drawings:
                 x=[drawing["x0"], drawing["x1"]],
                 y=[drawing["y0"], drawing["y1"]],
                 mode="lines",
-                name=drawing.get("label", "Trend line"),
                 showlegend=False,
                 line=dict(
                     color=drawing.get("color", "#f472b6"),
@@ -1731,41 +1938,44 @@ for drawing in st.session_state.drawings:
         )
 
 # ============================================================
-# CAMERA RANGE
+# CAMERA / AXIS CONTROL
 # ============================================================
-today_rows = chart_df[
+today_df = chart_df[
     chart_df["date_only"] == practice_day
-]
+].copy()
 
-if today_rows.empty:
-    today_start = chart_df["timestamp"].iloc[0]
-else:
-    today_start = today_rows["timestamp"].iloc[0]
+if today_df.empty:
+    today_df = chart_df.copy()
 
+# Follow mode means:
+# x-axis = current practice day
+# y-axis = current practice day highs/lows/EMAs
+#
+# This fixes tiny/invisible candles.
 if follow_replay:
-    # Follow ON: always go back to current replay day.
-    camera_start = today_start
+    focus_df = today_df
+
+    camera_start = today_df["timestamp"].iloc[0]
     camera_end = right_padding_timestamp(
         current_timestamp,
         active_interval,
     )
 
 else:
-    # Follow OFF: context preset determines initial range,
-    # then Plotly uirevision preserves manual zoom/pan.
-    camera_start = get_context_start_timestamp(
-        chart_df,
-        practice_day,
-        context_preset,
-    )
+    # With Follow OFF, context preset determines starting camera.
+    focus_df = chart_df
 
+    camera_start = chart_df["timestamp"].iloc[0]
     camera_end = right_padding_timestamp(
         current_timestamp,
         active_interval,
     )
+
+focus_price_range = get_price_axis_range(focus_df)
+focus_volume_range = get_volume_axis_range(focus_df)
 
 # ============================================================
-# LAYOUT
+# CHART LAYOUT
 # ============================================================
 if follow_replay:
     uirevision_value = (
@@ -1799,10 +2009,46 @@ fig.update_layout(
     uirevision=uirevision_value,
 )
 
-# Apply chart range only when:
-# - Follow ON
-# - First load/reset
-# - Context setting changes
+tick_format = "%m-%d\n%H:%M"
+
+if not TIMEFRAME_CONFIG[active_interval]["intraday"]:
+    tick_format = "%Y-%m-%d"
+
+for row_num in (1, 2):
+    fig.update_xaxes(
+        type="date",
+        tickformat=tick_format,
+        nticks=12,
+        gridcolor="#1f2937",
+        linecolor="#4b5563",
+        zerolinecolor="#374151",
+        showspikes=True,
+        spikemode="across",
+        spikecolor="#94a3b8",
+        spikethickness=1,
+        row=row_num,
+        col=1,
+    )
+
+fig.update_yaxes(
+    title_text="Price",
+    gridcolor="#1f2937",
+    linecolor="#4b5563",
+    row=1,
+    col=1,
+)
+
+fig.update_yaxes(
+    title_text="Volume",
+    gridcolor="#1f2937",
+    linecolor="#4b5563",
+    row=2,
+    col=1,
+)
+
+# Apply camera only when:
+# - Follow ON, or
+# - initial/reset/context change with Follow OFF.
 if apply_camera:
     fig.update_xaxes(
         range=[camera_start, camera_end],
@@ -1816,151 +2062,134 @@ if apply_camera:
         col=1,
     )
 
-    # After initial camera placement, allow manual pan/zoom if Follow OFF.
+    if focus_price_range is not None:
+        fig.update_yaxes(
+            range=focus_price_range,
+            row=1,
+            col=1,
+        )
+
+    if focus_volume_range is not None:
+        fig.update_yaxes(
+            range=focus_volume_range,
+            row=2,
+            col=1,
+        )
+
+    # After first camera setup, manual mode may preserve zoom.
     if not follow_replay:
         st.session_state.force_camera = False
 
-time_tick_format = "%m-%d\n%H:%M"
-if not TIMEFRAME_CONFIG[active_interval]["intraday"]:
-    time_tick_format = "%Y-%m-%d"
-
-for row in (1, 2):
-    fig.update_xaxes(
-        type="date",
-        tickformat=time_tick_format,
-        nticks=12,
-        gridcolor="#1f2937",
-        linecolor="#4b5563",
-        zerolinecolor="#374151",
-        showspikes=True,
-        spikemode="across",
-        spikecolor="#94a3b8",
-        spikethickness=1,
-        row=row,
-        col=1,
-    )
-
-fig.update_yaxes(
-    title_text="Price",
-    gridcolor="#1f2937",
-    linecolor="#4b5563",
-    row=1,
-    col=1,
-)
-
-# Volume axis cap to prevent one massive opening volume bar
-# from making all other bars invisible.
-if len(chart_df) and chart_df["volume"].max() > 0:
-    volume_cap = max(
-        chart_df["volume"].quantile(0.95) * 1.15,
-        chart_df["volume"].median() * 2,
-    )
-
-    fig.update_yaxes(
-        range=[0, volume_cap],
-        title_text="Volume",
-        gridcolor="#1f2937",
-        linecolor="#4b5563",
-        row=2,
-        col=1,
-    )
-else:
-    fig.update_yaxes(
-        title_text="Volume",
-        gridcolor="#1f2937",
-        linecolor="#4b5563",
-        row=2,
-        col=1,
-    )
-
 # ============================================================
-# CHART + TIME CONTROLS
+# CHART + RIGHT-SIDE CONTROLS
 # ============================================================
 chart_col, control_col = st.columns([6, 1])
 
 with chart_col:
     chart_event = None
 
-    # Newer Streamlit versions support on_select.
-    # Manual fallback drawing controls appear below if unavailable.
-    try:
-        chart_event = st.plotly_chart(
-            fig,
-            use_container_width=True,
-            on_select="rerun",
-            selection_mode="points",
-            key="human_replay_chart",
-            config={
-                "scrollZoom": True,
-                "displaylogo": False,
-            },
-        )
-    except TypeError:
+    # Important performance improvement:
+    # Only activate chart selection/reruns when drawing mode is active.
+    if draw_mode == "None":
         st.plotly_chart(
             fig,
             use_container_width=True,
-            key="human_replay_chart_fallback",
+            key="market_chart_view",
             config={
                 "scrollZoom": True,
                 "displaylogo": False,
             },
         )
 
-    # --------------------------------------------------------
-    # Process click-based drawing selection
-    # --------------------------------------------------------
-    selected_points = extract_selected_points(chart_event)
-
-    if draw_mode != "None" and selected_points:
-        point = selected_points[-1]
-        row = nearest_row_from_event(chart_df, point)
-
-        clicked_y = point.get("y")
-        point_index = point.get(
-            "point_index",
-            point.get("pointIndex", -1),
-        )
-
-        event_signature = (
-            draw_mode,
-            str(row["timestamp"]) if row is not None else "",
-            str(point_index),
-            str(clicked_y),
-            len(st.session_state.draw_clicks),
-        )
-
-        if event_signature != st.session_state.last_draw_event:
-            st.session_state.last_draw_event = event_signature
-            process_drawing_click(
-                draw_mode,
-                row,
-                clicked_y,
+    else:
+        try:
+            chart_event = st.plotly_chart(
+                fig,
+                use_container_width=True,
+                on_select="rerun",
+                selection_mode="points",
+                key="market_chart_draw",
+                config={
+                    "scrollZoom": True,
+                    "displaylogo": False,
+                },
             )
-            st.rerun()
+
+        except TypeError:
+            # Older Streamlit fallback.
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+                key="market_chart_draw_fallback",
+                config={
+                    "scrollZoom": True,
+                    "displaylogo": False,
+                },
+            )
+
+    # --------------------------------------------------------
+    # Drawing click processing.
+    # --------------------------------------------------------
+    if draw_mode != "None":
+        selected_points = extract_selected_points(chart_event)
+
+        if selected_points:
+            point = selected_points[-1]
+            selected_row = nearest_row_from_event(chart_df, point)
+
+            clicked_y = point.get("y")
+            curve = point.get("curve_number", point.get("curveNumber", ""))
+
+            signature = (
+                draw_mode,
+                str(selected_row["timestamp"]) if selected_row is not None else "",
+                str(clicked_y),
+                str(curve),
+            )
+
+            if signature != st.session_state.last_draw_signature:
+                st.session_state.last_draw_signature = signature
+
+                process_drawing_click(
+                    draw_mode,
+                    selected_row,
+                    clicked_y,
+                )
+
+                st.rerun()
 
 with control_col:
     st.markdown("#### ⏱️")
     st.caption(f"**{current_timestamp.strftime('%H:%M')}**")
     st.caption(f"Native {active_interval}")
 
+    # Buttons are based on selected native interval.
     if active_interval == "1m":
         button_1, button_2, button_3 = "+1m", "+5m", "+15m"
         step_1, step_2, step_3 = 1, 5, 15
 
     elif active_interval == "2m":
-        button_1, button_2, button_3 = "+1 bar", "+3 bars", "+8 bars"
-        step_1, step_2, step_3 = 1, 3, 8
+        button_1, button_2, button_3 = "+2m", "+10m", "+30m"
+        step_1, step_2, step_3 = 1, 5, 15
 
     elif active_interval == "5m":
-        button_1, button_2, button_3 = "+1 bar", "+3 bars", "+6 bars"
+        button_1, button_2, button_3 = "+5m", "+15m", "+30m"
         step_1, step_2, step_3 = 1, 3, 6
 
     elif active_interval == "15m":
-        button_1, button_2, button_3 = "+1 bar", "+2 bars", "+4 bars"
+        button_1, button_2, button_3 = "+15m", "+30m", "+60m"
         step_1, step_2, step_3 = 1, 2, 4
 
-    elif active_interval in ("30m", "90m", "1h"):
-        button_1, button_2, button_3 = "+1 bar", "+2 bars", "+4 bars"
+    elif active_interval == "30m":
+        button_1, button_2, button_3 = "+30m", "+60m", "+120m"
+        step_1, step_2, step_3 = 1, 2, 4
+
+    elif active_interval == "90m":
+        button_1, button_2, button_3 = "+90m", "+180m", "+360m"
+        step_1, step_2, step_3 = 1, 2, 4
+
+    elif active_interval == "1h":
+        button_1, button_2, button_3 = "+1h", "+2h", "+4h"
         step_1, step_2, step_3 = 1, 2, 4
 
     else:
@@ -1990,29 +2219,29 @@ with control_col:
 
     st.caption(f"Context:\n{context_preset}")
     st.caption(f"Follow:\n{'ON' if follow_replay else 'OFF'}")
+    st.caption(f"Rendered bars:\n{len(chart_df):,}")
     st.caption(f"Drawings:\n{len(st.session_state.drawings)}")
-
 
 # ============================================================
 # MANUAL DRAWING FALLBACK
 # ============================================================
 with st.expander("✏️ Manual drawing helpers", expanded=False):
     st.caption(
-        "Use this if click-to-draw does not work reliably in your Streamlit version."
+        "Use this if click-to-draw is unreliable in your browser/Streamlit version."
     )
 
-    candle_options = chart_df.copy()
-    candle_options["choice"] = candle_options["timestamp"].dt.strftime(
+    helper_df = chart_df.copy()
+    helper_df["choice"] = helper_df["timestamp"].dt.strftime(
         "%Y-%m-%d %H:%M"
     )
 
     selected_choice = st.selectbox(
         "Select candle",
-        candle_options["choice"].tolist()[::-1],
+        helper_df["choice"].tolist()[::-1],
     )
 
-    selected_row = candle_options[
-        candle_options["choice"] == selected_choice
+    selected_row = helper_df[
+        helper_df["choice"] == selected_choice
     ].iloc[0]
 
     d1, d2, d3, d4, d5 = st.columns(5)
@@ -2020,42 +2249,48 @@ with st.expander("✏️ Manual drawing helpers", expanded=False):
     with d1:
         if st.button("High line"):
             price = float(selected_row["high"])
+
             add_horizontal_line(
                 price,
                 label=f"H {price:.2f}",
                 color="#ef4444",
             )
+
             st.rerun()
 
     with d2:
         if st.button("Close line"):
             price = float(selected_row["close"])
+
             add_horizontal_line(
                 price,
                 label=f"C {price:.2f}",
                 color="#22d3ee",
             )
+
             st.rerun()
 
     with d3:
         if st.button("Low line"):
             price = float(selected_row["low"])
+
             add_horizontal_line(
                 price,
                 label=f"L {price:.2f}",
                 color="#22c55e",
             )
+
             st.rerun()
 
     with d4:
         if st.button("Band / Trend point"):
-            mode_to_use = draw_mode
+            use_mode = draw_mode
 
-            if mode_to_use not in ("Band", "Trend line"):
-                mode_to_use = "Band"
+            if use_mode not in ("Band", "Trend line"):
+                use_mode = "Band"
 
             process_drawing_click(
-                mode_to_use,
+                use_mode,
                 selected_row,
                 float(selected_row["close"]),
             )
@@ -2065,12 +2300,11 @@ with st.expander("✏️ Manual drawing helpers", expanded=False):
     with d5:
         if st.button("Clear pending"):
             st.session_state.draw_clicks = []
-            st.session_state.last_draw_event = None
+            st.session_state.last_draw_signature = None
             st.rerun()
 
-
 # ============================================================
-# TRADE PANEL
+# TRADE ENTRY PANEL
 # ============================================================
 if pos == 0:
     st.markdown("### 🎮 Open a Position")
@@ -2119,7 +2353,11 @@ if pos == 0:
                 st.session_state.balance -= bet_size
                 st.session_state.shares = shares
                 st.session_state.stop_loss = float(sl_input)
-                st.session_state.target = float(tp_input) if tp_input > 0 else None
+                st.session_state.target = (
+                    float(tp_input)
+                    if tp_input > 0
+                    else None
+                )
                 st.session_state.entry_price = current_price
 
                 st.session_state.trade_log.append(
@@ -2154,7 +2392,11 @@ if pos == 0:
                 st.session_state.balance += bet_size
                 st.session_state.shares = -shares
                 st.session_state.stop_loss = float(sl_input)
-                st.session_state.target = float(tp_input) if tp_input > 0 else None
+                st.session_state.target = (
+                    float(tp_input)
+                    if tp_input > 0
+                    else None
+                )
                 st.session_state.entry_price = current_price
 
                 st.session_state.trade_log.append(
@@ -2172,6 +2414,9 @@ if pos == 0:
 
                 st.rerun()
 
+# ============================================================
+# TRADE MANAGEMENT PANEL
+# ============================================================
 else:
     st.markdown(f"### 🎮 Manage {pos_type} Position")
 
@@ -2227,7 +2472,11 @@ else:
 
             if valid:
                 st.session_state.stop_loss = float(new_sl)
-                st.session_state.target = float(new_tp) if new_tp > 0 else None
+                st.session_state.target = (
+                    float(new_tp)
+                    if new_tp > 0
+                    else None
+                )
 
                 st.session_state.trade_log.append(
                     f"{current_time_text}: UPDATED "
@@ -2254,7 +2503,6 @@ else:
 
                 st.rerun()
 
-
 # ============================================================
 # TRADE HISTORY
 # ============================================================
@@ -2263,35 +2511,32 @@ if st.session_state.trade_log:
         for log in reversed(st.session_state.trade_log):
             st.text(log)
 
-
 # ============================================================
-# SESSION INFO
+# SESSION INFORMATION
 # ============================================================
 with st.expander("📘 Replay Information"):
     st.markdown(
         f"""
-### Active Replay
-
 | Item | Value |
 |---|---|
 | Ticker | `{active_ticker}` |
 | Native timeframe | `{active_interval}` |
 | Practice date | `{practice_day}` |
 | Current replay time | `{current_time_text}` |
-| Revealed bars | `{len(revealed_df):,}` |
-| Current price | `${current_price:.2f}` |
+| All revealed bars used for EMA | `{len(calc_df):,}` |
+| Bars rendered in chart | `{len(chart_df):,}` |
 | Follow replay | `{"ON" if follow_replay else "OFF"}` |
 | Context preset | `{context_preset}` |
 | Saved drawings | `{len(st.session_state.drawings)}` |
 
 ### Important behavior
 
-- Native `{active_interval}` data is used directly from Yahoo.
-- Historical bars before the practice day are fully available.
-- Current replay-day bars are hidden until you advance.
-- EMAs use all revealed historical bars plus revealed current-day bars.
-- With **Follow ON**, each advance returns camera focus to the current replay day.
-- With **Follow OFF**, you can inspect historical support/resistance without being forced back.
-- Native 5m/15m stop-loss simulation uses OHLC bars. If both target and stop occur inside one higher-timeframe candle, this version assumes stop occurs first.
+- Native `{active_interval}` candles come directly from Yahoo.
+- Current replay day reveals bars only up to the current simulation time.
+- EMA calculations use all revealed historical data.
+- Chart rendering uses only the selected context to remain fast.
+- Follow ON zooms both x-axis and y-axis onto current replay candles.
+- Follow OFF preserves manual zoom/pan after the initial camera setup.
+- Structure labels and S/R zones are intentionally capped for speed.
 """
     )
