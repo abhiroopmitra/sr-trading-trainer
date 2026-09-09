@@ -20,6 +20,8 @@
 # - Follow ON: 220-bar sliding window for continuous
 #   instruments (futures, forex, crypto)
 # - Follow ON: current-session zoom for stocks/ETFs
+# - Replay continues past practice date into next sessions
+# - 4 advance buttons: +1bar, +15m, +30m, +60m
 #
 # Recommended packages:
 # pip install streamlit plotly pandas numpy yfinance
@@ -1124,7 +1126,7 @@ def advance_bars(number_of_bars):
 
     for _ in range(int(number_of_bars)):
         if st.session_state.step >= max_step:
-            st.toast("Replay session complete.", icon="\U0001f514")
+            st.toast("Replay complete. No more bars available.", icon="\U0001f514")
             break
 
         previous_row = dataframe.iloc[st.session_state.step]
@@ -1409,9 +1411,9 @@ if st.sidebar.button(
     width="stretch",
     disabled=(filtered_df.empty or not can_start),
 ):
-    active_df = filtered_df[
-        filtered_df["session_date"] <= practice_date
-    ].copy().reset_index(drop=True)
+    # Use ALL available data so replay can continue past
+    # the practice date into subsequent sessions.
+    active_df = filtered_df.copy().reset_index(drop=True)
 
     matching_indices = active_df.index[
         active_df["timestamp"] == selected_start_timestamp
@@ -1836,6 +1838,13 @@ volume_range = get_volume_axis_range(focus_df)
 # CHART LAYOUT
 # ============================================================
 
+if follow_replay and is_continuous:
+    camera_label = f"Follow: {FOLLOW_WINDOW_BARS} bars"
+elif follow_replay:
+    camera_label = "Follow: current session"
+else:
+    camera_label = "Compressed"
+
 figure.update_layout(
     template="plotly_dark",
     height=640,
@@ -1847,7 +1856,7 @@ figure.update_layout(
         f"{st.session_state.active_ticker} | "
         f"{st.session_state.active_interval} | "
         f"{current_time_text} | "
-        f"{'Follow: ' + str(FOLLOW_WINDOW_BARS) + ' bars' if (follow_replay and is_continuous) else 'Compressed'}"
+        f"{camera_label}"
     ),
     margin=dict(l=10, r=190, t=42, b=10),
     showlegend=True,
@@ -1922,27 +1931,47 @@ with control_col:
     interval_minutes = TIMEFRAME_CONFIG[st.session_state.active_interval]["minutes"]
 
     if interval_minutes >= 1440:
-        step_one, step_two, step_three = 1, 3, 5
-        label_one, label_two, label_three = "+1 day", "+3 days", "+5 days"
+        # Daily timeframe: 4 buttons
+        btn_steps = [1, 3, 5, 10]
+        btn_labels = ["+1d", "+3d", "+5d", "+10d"]
     else:
-        step_one = 1
-        step_two = max(1, round(15 / interval_minutes))
-        step_three = max(1, round(60 / interval_minutes))
-        label_one = f"+{interval_minutes}m"
-        label_two = f"+{interval_minutes * step_two}m"
-        label_three = f"+{interval_minutes * step_three}m"
+        # Intraday: 4 buttons = 1 bar, ~15m, ~30m, ~60m
+        btn_steps = [
+            1,
+            max(1, round(15 / interval_minutes)),
+            max(1, round(30 / interval_minutes)),
+            max(1, round(60 / interval_minutes)),
+        ]
+        btn_labels = [
+            f"+{interval_minutes}m",
+            f"+{interval_minutes * btn_steps[1]}m",
+            f"+{interval_minutes * btn_steps[2]}m",
+            f"+{interval_minutes * btn_steps[3]}m",
+        ]
 
-    if st.button(f"\u25b6\ufe0f {label_one}", width="stretch"):
-        advance_bars(step_one)
-        st.rerun()
+    # Deduplicate if any steps are the same (e.g. 15m timeframe)
+    unique_steps = []
+    unique_labels = []
+    for s, l in zip(btn_steps, btn_labels):
+        if s not in unique_steps:
+            unique_steps.append(s)
+            unique_labels.append(l)
 
-    if st.button(f"\u23e9 {label_two}", width="stretch"):
-        advance_bars(step_two)
-        st.rerun()
+    # Ensure we always have at least 3, at most 4 buttons
+    while len(unique_steps) < 3:
+        next_step = unique_steps[-1] + 1
+        unique_steps.append(next_step)
+        unique_labels.append(f"+{interval_minutes * next_step}m")
 
-    if st.button(f"\u23ed\ufe0f {label_three}", width="stretch"):
-        advance_bars(step_three)
-        st.rerun()
+    unique_steps = unique_steps[:4]
+    unique_labels = unique_labels[:4]
+
+    for i, (s, l) in enumerate(zip(unique_steps, unique_labels)):
+        icons = ["\u25b6\ufe0f", "\u23e9", "\u23ed\ufe0f", "\u23e9"]
+        icon = icons[i] if i < len(icons) else "\u23e9"
+        if st.button(f"{icon} {l}", width="stretch"):
+            advance_bars(s)
+            st.rerun()
 
     st.markdown("---")
     st.caption(f"Session: {current_session_date}")
@@ -1954,6 +1983,9 @@ with control_col:
     st.caption(
         f"Asset: {asset_class} "
         f"({'continuous' if is_continuous else 'session-based'})"
+    )
+    st.caption(
+        f"Bar: {step + 1} / {len(dataframe):,}"
     )
 
 
@@ -2129,112 +2161,3 @@ else:
 
 
 # ============================================================
-# PERSISTENT TRADE HISTORY
-# ============================================================
-
-with st.expander("\U0001f4dd Persistent Trade History", expanded=False):
-    connection = get_connection()
-    trades = pd.read_sql_query(
-        """
-        SELECT cycle_number, ticker, asset_class, side, quantity,
-               entry_price, exit_price, entry_time, exit_time,
-               realized_pnl, reason
-        FROM trades
-        WHERE account_id = ?
-        ORDER BY id DESC
-        """,
-        connection,
-        params=(ACCOUNT_ID,),
-    )
-    connection.close()
-
-    if trades.empty:
-        st.info("No closed trades recorded yet.")
-    else:
-        st.dataframe(trades, width="stretch", hide_index=True)
-
-
-# ============================================================
-# ACCOUNT EVENTS
-# ============================================================
-
-with st.expander("\U0001f501 Account Cycles and Events", expanded=False):
-    connection = get_connection()
-    events = pd.read_sql_query(
-        """
-        SELECT cycle_number, event_type, message, created_at
-        FROM account_events
-        WHERE account_id = ?
-        ORDER BY id DESC
-        """,
-        connection,
-        params=(ACCOUNT_ID,),
-    )
-    connection.close()
-
-    if events.empty:
-        st.info("No account-cycle events recorded.")
-    else:
-        st.dataframe(events, width="stretch", hide_index=True)
-
-
-# ============================================================
-# REPLAY INFORMATION
-# ============================================================
-
-with st.expander("\U0001f4d8 Replay Information", expanded=False):
-    st.markdown(
-        f"""
-| Item | Value |
-|---|---|
-| Ticker | `{st.session_state.active_ticker}` |
-| Asset class | `{asset_class}` |
-| Continuous | `{'Yes' if is_continuous else 'No'}` |
-| Native timeframe | `{st.session_state.active_interval}` |
-| Session mode | `{st.session_state.active_session_mode}` |
-| Practice session | `{practice_date}` |
-| Current replay time | `{current_time_text}` |
-| Current session date | `{current_session_date}` |
-| Revealed bars | `{len(revealed_df):,}` |
-| Rendered bars | `{len(chart_df):,}` |
-| Visible bars | `{window_end - window_start + 1}` |
-| Follow replay | `{"ON" if follow_replay else "OFF"}` |
-| Follow window | `{'220 bars (continuous)' if (follow_replay and is_continuous) else 'Current session' if follow_replay else 'Full context'}` |
-| Position carry | `{"ON" if st.session_state.active_carry_mode else "OFF"}` |
-| Account cycle | `{account['cycle_number']}` |
-| Database | `{os.path.abspath(DB_PATH)}` |
-
-### Session behavior
-
-- US stocks and ETFs use regular market hours by default.
-- Overnight, weekends, holidays, and regular-hours gaps are removed.
-- Futures retain the overnight session but remove the daily maintenance break.
-- Forex continues through weekdays and skips the weekend.
-- Crypto retains all bars because crypto trades continuously.
-- The chart uses sequential bar positions instead of calendar timestamps.
-- Actual price gaps remain visible because OHLC prices are unchanged.
-
-### Follow camera behavior
-
-- **Continuous instruments** (futures, forex, crypto):
-  Follow ON shows the last **{FOLLOW_WINDOW_BARS} bars** ending at the
-  current replay bar. The window slides forward as you advance.
-  Crossing a session boundary, midnight, or calendar day does NOT
-  reset the view. Previous bars remain visible as long as they are
-  within the {FOLLOW_WINDOW_BARS}-bar lookback.
-
-- **Session-based instruments** (stocks, ETFs):
-  Follow ON zooms into the current practice session
-  (e.g. 09:30-16:00). The next session starts fresh.
-
-### Account behavior
-
-- Cash and trades persist in SQLite.
-- The wallet survives browser refreshes and app restarts.
-- Positions remain open across sessions when position carry is enabled.
-- Equity equals cash plus the current marked value of the open position.
-- Account reset occurs only after the account is actually depleted.
-- Realized P&L is tracked per closed trade and accumulated in the account.
-- Unrealized P&L is calculated live from the current mark price.
-"""
-    )
