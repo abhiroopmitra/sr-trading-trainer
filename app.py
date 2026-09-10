@@ -1,9 +1,9 @@
 # ============================================================
 # HUMAN MARKET REPLAY SIMULATOR
-# - Fixed: Range Slider "ghost candle" bug on volume chart
-# - Fixed: Y-axis now stretches to fit full context when zoomed out
-# - Restored: Full MA controls (EMA/SMA, Fast/Slow) & Structure/Zone toggles
-# - Persistent SQLite Database
+# - FIXED: Database self-healing for schema mismatches
+# - Range Slider "ghost candle" bug fixed
+# - Y-axis auto-fits full context when Follow is OFF
+# - Full MA controls & Structure/Zone toggles restored
 # ============================================================
 
 import streamlit as st
@@ -17,24 +17,58 @@ import sqlite3
 st.set_page_config(layout="wide", page_title="Market Replay Simulator")
 
 # ============================================================
-# DATABASE SETUP (PERSISTENT WALLET)
+# DATABASE SETUP (PERSISTENT WALLET) - WITH SELF-HEALING SCHEMA
 # ============================================================
 DB_FILE = "paper_trading.db"
+
+def _table_has_columns(cursor, table_name, required_cols):
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    existing_cols = {row[1] for row in cursor.fetchall()}
+    return required_cols.issubset(existing_cols)
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+
+    # Create tables if they don't exist at all
     c.execute('''CREATE TABLE IF NOT EXISTS account
                  (id INTEGER PRIMARY KEY, balance REAL, realized_pnl REAL, cycle INTEGER, status TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS positions
                  (id INTEGER PRIMARY KEY, ticker TEXT, qty REAL, entry_price REAL, sl REAL, tp REAL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS history
                  (id INTEGER PRIMARY KEY, cycle INTEGER, log_text TEXT)''')
-    
+    conn.commit()
+
+    # --------------------------------------------------------
+    # SELF-HEALING SCHEMA CHECK
+    # If a table exists from an OLDER version of this app with
+    # different/missing columns, drop and rebuild just that table.
+    # --------------------------------------------------------
+    required_schemas = {
+        "account": {"id", "balance", "realized_pnl", "cycle", "status"},
+        "positions": {"id", "ticker", "qty", "entry_price", "sl", "tp"},
+        "history": {"id", "cycle", "log_text"},
+    }
+
+    for table, required_cols in required_schemas.items():
+        if not _table_has_columns(c, table, required_cols):
+            c.execute(f"DROP TABLE IF EXISTS {table}")
+            conn.commit()
+
+    # Recreate any tables that were just dropped
+    c.execute('''CREATE TABLE IF NOT EXISTS account
+                 (id INTEGER PRIMARY KEY, balance REAL, realized_pnl REAL, cycle INTEGER, status TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS positions
+                 (id INTEGER PRIMARY KEY, ticker TEXT, qty REAL, entry_price REAL, sl REAL, tp REAL)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS history
+                 (id INTEGER PRIMARY KEY, cycle INTEGER, log_text TEXT)''')
+    conn.commit()
+
+    # Initialize first account if empty
     c.execute("SELECT * FROM account WHERE status='ACTIVE'")
     if not c.fetchone():
         c.execute("INSERT INTO account (balance, realized_pnl, cycle, status) VALUES (1000.0, 0.0, 1, 'ACTIVE')")
-        
+
     conn.commit()
     conn.close()
 
@@ -43,31 +77,37 @@ def get_active_account():
     c = conn.cursor()
     c.execute("SELECT balance, realized_pnl, cycle FROM account WHERE status='ACTIVE'")
     acc = c.fetchone()
-    
+
+    if acc is None:
+        # Absolute fallback in case something is still wrong
+        c.execute("INSERT INTO account (balance, realized_pnl, cycle, status) VALUES (1000.0, 0.0, 1, 'ACTIVE')")
+        conn.commit()
+        acc = (1000.0, 0.0, 1)
+
     c.execute("SELECT qty, entry_price, sl, tp FROM positions LIMIT 1")
     pos = c.fetchone()
-    
+
     c.execute("SELECT log_text FROM history WHERE cycle=? ORDER BY id ASC", (acc[2],))
     logs = [row[0] for row in c.fetchall()]
     conn.close()
-    
+
     return acc, pos, logs
 
 def save_state_to_db(balance, realized_pnl, qty, entry, sl, tp, new_log=None):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("UPDATE account SET balance=?, realized_pnl=? WHERE status='ACTIVE'", (balance, realized_pnl))
-    
+
     c.execute("DELETE FROM positions")
     if qty != 0:
-        c.execute("INSERT INTO positions (ticker, qty, entry_price, sl, tp) VALUES ('MIXED', ?, ?, ?, ?)", 
+        c.execute("INSERT INTO positions (ticker, qty, entry_price, sl, tp) VALUES ('MIXED', ?, ?, ?, ?)",
                   (qty, entry, sl, tp))
-        
+
     if new_log:
         c.execute("SELECT cycle FROM account WHERE status='ACTIVE'")
         cycle = c.fetchone()[0]
         c.execute("INSERT INTO history (cycle, log_text) VALUES (?, ?)", (cycle, new_log))
-        
+
     conn.commit()
     conn.close()
 
@@ -77,7 +117,7 @@ def blow_up_account():
     c.execute("UPDATE account SET status='DEPLETED' WHERE status='ACTIVE'")
     c.execute("SELECT MAX(cycle) FROM account")
     last_cycle = c.fetchone()[0]
-    
+
     new_cycle = last_cycle + 1
     c.execute("INSERT INTO account (balance, realized_pnl, cycle, status) VALUES (1000.0, 0.0, ?, 'ACTIVE')", (new_cycle,))
     c.execute("DELETE FROM positions")
@@ -202,10 +242,10 @@ def normalize_ohlcv(raw, intraday=True):
 
     valid = (out["high"] >= out["low"]) & (out["open"] > 0)
     out = out[valid].copy()
-    
+
     out["x_str"] = out["timestamp"].dt.strftime("%Y-%m-%d %H:%M")
     out["date_only"] = out["timestamp"].dt.date
-    
+
     return out.reset_index(drop=True)
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -231,7 +271,7 @@ def get_context_render_df(revealed_df, practice_date, preset):
     idx = unique_dates.index(practice_date)
     days_map = {"Today": 0, "5 Previous Days": 5, "20 Previous Days": 20, "All Available History": 99999}
     days_back = days_map.get(preset, 5)
-    
+
     start_date = unique_dates[max(0, idx - days_back)]
     return revealed_df[revealed_df["date_only"] >= start_date].copy()
 
@@ -301,7 +341,7 @@ def build_zones(labeled, ref_price):
         if not placed:
             zones.append({"mid": s["price"], "prices": [s["price"]], "touches": 1,
                           "low_touches": 1 if s["type"]=="L" else 0, "high_touches": 1 if s["type"]=="H" else 0})
-    
+
     out = [z for z in zones if z["touches"] >= MIN_DRAW_TOUCHES]
     for z in out: z["min_px"] = min(z["prices"]); z["max_px"] = max(z["prices"])
     return out
@@ -418,7 +458,7 @@ def advance_bars(number_of_bars):
 
         prev_date = df.iloc[st.session_state.step]["date_only"]
         st.session_state.step += 1
-        
+
         row = df.iloc[st.session_state.step]
         x_str = row["x_str"]
         pos = float(st.session_state.shares)
@@ -510,11 +550,11 @@ if ticker:
 if not source_df.empty:
     available_dates = sorted(source_df["date_only"].unique())
     default_date = available_dates[-3] if len(available_dates) >= 3 else available_dates[-1]
-    
+
     st.sidebar.success(f"{len(source_df):,} bars available")
     practice_date = st.sidebar.date_input("Practice Date", min_value=available_dates[0], max_value=available_dates[-1], value=default_date)
     practice_rows = source_df[source_df["date_only"] == practice_date]
-    
+
     if not practice_rows.empty:
         start_labels = practice_rows["x_str"].tolist()
         selected_start_str = st.sidebar.selectbox("Start Time", start_labels, index=min(10, len(start_labels)-1))
@@ -523,7 +563,7 @@ if not source_df.empty:
 if st.sidebar.button("🚀 Start / Reset Replay", disabled=not can_start):
     active_df = source_df.copy().reset_index(drop=True)
     idx_list = active_df.index[active_df["x_str"] == selected_start_str].tolist()
-    
+
     st.session_state.df = active_df
     st.session_state.step = idx_list[0]
     st.session_state.active_ticker = ticker
@@ -531,7 +571,7 @@ if st.sidebar.button("🚀 Start / Reset Replay", disabled=not can_start):
     st.session_state.active_practice_date = practice_date
     st.session_state.session_mode = applied_session
     st.session_state.carry_overnight = carry_overnight
-    
+
     st.session_state.camera_revision += 1
     st.session_state.force_camera = True
     st.session_state.sim_active = True
@@ -570,7 +610,7 @@ if pos > 0:
     unrealized = pos_val - (pos * st.session_state.entry_price)
 elif pos < 0:
     pos_type = "🔴 SHORT"
-    pos_val = -(abs(pos) * current_price) 
+    pos_val = -(abs(pos) * current_price)
     equity = st.session_state.balance + pos_val
     unrealized = (abs(pos) * st.session_state.entry_price) - abs(pos) * current_price
 else:
@@ -595,12 +635,12 @@ st.caption(f"Account cycle {st.session_state.cycle} • Starting $1000.00 • Se
 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.78, 0.22], vertical_spacing=0.03)
 
 fig.add_trace(go.Candlestick(
-    x=chart_df["x_str"], 
-    open=chart_df["open"], 
-    high=chart_df["high"], 
-    low=chart_df["low"], 
+    x=chart_df["x_str"],
+    open=chart_df["open"],
+    high=chart_df["high"],
+    low=chart_df["low"],
     close=chart_df["close"],
-    name=st.session_state.active_ticker, 
+    name=st.session_state.active_ticker,
     increasing=dict(line=dict(color="#26a69a"), fillcolor="#26a69a"),
     decreasing=dict(line=dict(color="#ef5350"), fillcolor="#ef5350")
 ), row=1, col=1)
@@ -615,7 +655,6 @@ if show_ma and "fast_ma" in chart_df.columns:
 if show_vol_ma and "vol_ma" in chart_df.columns:
     fig.add_trace(go.Scatter(x=chart_df["x_str"], y=chart_df["vol_ma"], name=f"VolMA{int(vol_ma_len)}", line=dict(color=C_VOL_MA, width=1.7)), row=2, col=1)
 
-# FIX: type=category + explicitly killing rangeslider on BOTH rows prevents "ghost candle" duplication
 fig.update_xaxes(type='category', categoryorder='array', categoryarray=chart_df["x_str"], nticks=12, gridcolor="#1f2937", showspikes=True, spikemode="across")
 fig.update_xaxes(rangeslider_visible=False, row=1, col=1)
 fig.update_xaxes(rangeslider_visible=False, row=2, col=1)
@@ -638,7 +677,7 @@ if show_struct or show_zones:
     struct_df = chart_df.tail(MAX_STRUCTURE_BARS).copy().reset_index(drop=True)
     labeled = _raw_swings(struct_df)
     conf_swings = [s for s in labeled if s["i"] + SWING_K <= len(struct_df) - 1]
-    
+
     if show_struct:
         bos, choch = detect_bos_choch(struct_df, labeled)
         for s in conf_swings[-MAX_SWING_LABELS:]:
@@ -667,18 +706,17 @@ if show_struct or show_zones:
 for d in st.session_state.drawings:
     if d["type"] == "hline": fig.add_hline(y=d["price"], line=dict(color=d.get("color", "#22d3ee")))
     elif d["type"] == "band": fig.add_hrect(y0=d["y0"], y1=d["y1"], fillcolor="rgba(34,197,94,0.18)", line_width=0, layer="below")
-    elif d["type"] == "trend": 
+    elif d["type"] == "trend":
         if d["x0"] in chart_df["x_str"].values and d["x1"] in chart_df["x_str"].values:
             fig.add_trace(go.Scatter(x=[d["x0"], d["x1"]], y=[d["y0"], d["y1"]], mode="lines", line=dict(color="#f472b6")))
 
 # ============================================================
-# CAMERA CONTROL — FIXED Y-AXIS SCALING
+# CAMERA CONTROL
 # ============================================================
 apply_camera = follow_replay or st.session_state.force_camera
 
 if apply_camera:
     if follow_replay:
-        # Tight, windowed "current action" view
         if "Continuous" in st.session_state.session_mode:
             end_idx = len(chart_df) - 1
             start_idx = max(0, end_idx - 220)
@@ -692,8 +730,6 @@ if apply_camera:
         pad = 10
         end_idx = min(len(chart_df) - 1, end_idx + pad)
     else:
-        # FOLLOW OFF: fit the ENTIRE selected context (e.g. all 5 previous days)
-        # so nothing gets clipped off the top/bottom of the Y-axis.
         start_idx, end_idx = 0, len(chart_df) - 1
 
     fig.update_xaxes(range=[start_idx - 0.5, end_idx + 0.5], row=1, col=1)
@@ -707,7 +743,6 @@ if apply_camera:
 
     st.session_state.force_camera = False
 
-# uirevision preserves manual pan/zoom when Follow is OFF and camera isn't being forced
 uirevision_key = f"follow-{step}" if follow_replay else f"manual-{st.session_state.camera_revision}"
 
 fig.update_layout(
@@ -717,7 +752,6 @@ fig.update_layout(
     uirevision=uirevision_key,
 )
 
-# Rendering UI
 c1, c2 = st.columns([6, 1])
 with c1:
     if draw_mode == "None":
@@ -728,7 +762,7 @@ with c1:
             pt = event.selection.points[-1]
             x_str = pt.get("x")
             clicked_y = pt.get("y")
-            
+
             if (draw_mode, x_str, clicked_y) != st.session_state.last_draw_signature:
                 st.session_state.last_draw_signature = (draw_mode, x_str, clicked_y)
                 row_match = chart_df[chart_df["x_str"] == x_str]
@@ -748,7 +782,7 @@ with c1:
 
 with c2:
     st.markdown(f"**{current_x_str}**")
-    
+
     mins = TIMEFRAME_CONFIG[st.session_state.active_interval]["minutes"]
     if st.button("▶️ +5m"): advance_bars(max(1, 5 // mins)); st.rerun()
     if st.button("⏩ +15m"): advance_bars(max(1, 15 // mins)); st.rerun()
@@ -823,7 +857,7 @@ with st.expander("📘 Replay Information"):
 | Saved drawings | `{len(st.session_state.drawings)}` |
 
 ### Database Persistence
-This app uses a local SQLite database (`paper_trading.db`) to store your wallet. 
+This app uses a local SQLite database (`paper_trading.db`) to store your wallet.
 You can switch tickers, refresh the page, or stop the server, and your cash, positions, and history will remain fully intact.
 """
     )
