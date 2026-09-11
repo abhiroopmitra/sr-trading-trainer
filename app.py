@@ -11,9 +11,9 @@
 # - Persistent manual drawings by ticker
 # - Manual drawing helper
 # - Structure labels and local S/R zones
-# - Automatic S/R from 5 COMPLETED trading sessions
+# - Automatic S/R from 5 completed sessions
 # - Developing current-session high and low
-# - Replay continues across maintenance breaks and sessions
+# - Dedicated right-side S/R label rail
 # ============================================================
 
 import json
@@ -145,7 +145,12 @@ DRAW_MODES = [
 
 AUTO_SR_LOOKBACK_SESSIONS = 5
 
-# Structure settings
+# Right-side rail sizing.
+MIN_LABEL_RAIL_BARS = 16
+MAX_LABEL_RAIL_BARS = 34
+LABEL_RAIL_PERCENT = 0.18
+
+# Structure settings.
 MAX_STRUCTURE_BARS = 700
 MAX_SWING_LABELS = 90
 MAX_BOS_LABELS = 30
@@ -160,7 +165,7 @@ MIN_SWING_PCT = 0.0008
 POLARITY_EDGE = 2
 CHOCH_ENABLE = True
 
-# Colors
+# Colors.
 C_HH = {"fg": "#ffffff", "bg": "#16a34a"}
 C_LH = {"fg": "#ffffff", "bg": "#dc2626"}
 C_H = {"fg": "#ffffff", "bg": "#475569"}
@@ -183,8 +188,11 @@ C_VOL_MA = "#ff6d00"
 C_AUTO_SUPPORT = "#22c55e"
 C_AUTO_RESISTANCE = "#ef4444"
 C_AUTO_PIVOT = "#eab308"
+
 C_DEVELOPING_HIGH = "#38bdf8"
 C_DEVELOPING_LOW = "#c084fc"
+
+C_MANUAL_SR = "#eab308"
 
 
 # ============================================================
@@ -228,12 +236,12 @@ def to_pydate(value):
         return value
 
     try:
-        result = pd.Timestamp(value)
+        timestamp = pd.Timestamp(value)
 
-        if pd.isna(result):
+        if pd.isna(timestamp):
             return None
 
-        return result.date()
+        return timestamp.date()
 
     except Exception:
         return None
@@ -303,14 +311,14 @@ def price_decimals(price):
 
 
 def format_price(price, include_dollar=True):
-    decimals = price_decimals(price)
-
     try:
         value = float(price)
     except Exception:
         value = 0.0
 
+    decimals = price_decimals(value)
     prefix = "$" if include_dollar else ""
+
     return f"{prefix}{value:,.{decimals}f}"
 
 
@@ -319,8 +327,7 @@ def price_input_format(price):
 
 
 def price_input_step(price):
-    decimals = price_decimals(price)
-    return float(10 ** (-decimals))
+    return float(10 ** (-price_decimals(price)))
 
 
 def bars_for_minutes(target_minutes, native_minutes):
@@ -335,9 +342,6 @@ def bars_for_minutes(target_minutes, native_minutes):
 
 # ============================================================
 # DATABASE
-#
-# Uses new table names so older incompatible schemas do not
-# cause "no such column" errors.
 # ============================================================
 def get_connection():
     connection = sqlite3.connect(
@@ -380,11 +384,8 @@ def row_value(row, key, default=None):
         return default
 
     try:
-        keys = row.keys()
-
-        if key in keys and row[key] is not None:
+        if key in row.keys() and row[key] is not None:
             return row[key]
-
     except Exception:
         pass
 
@@ -476,10 +477,7 @@ def initialize_database():
         """
     )
 
-    # --------------------------------------------------------
-    # ACCOUNT MIGRATION
-    # --------------------------------------------------------
-    account_exists = cursor.execute(
+    existing_account = cursor.execute(
         """
         SELECT account_id
         FROM replay_accounts
@@ -488,22 +486,24 @@ def initialize_database():
         (ACCOUNT_ID,),
     ).fetchone()
 
-    if account_exists is None:
+    if existing_account is None:
         starting_balance = STARTING_BALANCE
         cash_balance = STARTING_BALANCE
         realized_pnl = 0.0
         cycle_number = 1
 
-        # Try newer legacy table: accounts
+        # Best-effort migration from the previous "accounts" table.
         if table_exists(connection, "accounts"):
             columns = table_columns(connection, "accounts")
 
-            if {
+            required = {
                 "cash_balance",
                 "realized_pnl",
                 "cycle_number",
-            }.issubset(columns):
-                legacy_account = connection.execute(
+            }
+
+            if required.issubset(columns):
+                old_account = connection.execute(
                     """
                     SELECT *
                     FROM accounts
@@ -513,10 +513,10 @@ def initialize_database():
                     (ACCOUNT_ID,),
                 ).fetchone()
 
-                if legacy_account is not None:
+                if old_account is not None:
                     starting_balance = float(
                         row_value(
-                            legacy_account,
+                            old_account,
                             "starting_balance",
                             STARTING_BALANCE,
                         )
@@ -524,7 +524,7 @@ def initialize_database():
 
                     cash_balance = float(
                         row_value(
-                            legacy_account,
+                            old_account,
                             "cash_balance",
                             STARTING_BALANCE,
                         )
@@ -532,7 +532,7 @@ def initialize_database():
 
                     realized_pnl = float(
                         row_value(
-                            legacy_account,
+                            old_account,
                             "realized_pnl",
                             0.0,
                         )
@@ -540,19 +540,19 @@ def initialize_database():
 
                     cycle_number = int(
                         row_value(
-                            legacy_account,
+                            old_account,
                             "cycle_number",
                             1,
                         )
                     )
 
-        # Try oldest legacy table: account
+        # Best-effort migration from the oldest "account" table.
         elif table_exists(connection, "account"):
             columns = table_columns(connection, "account")
 
             if "balance" in columns:
                 if "status" in columns:
-                    legacy_account = connection.execute(
+                    old_account = connection.execute(
                         """
                         SELECT *
                         FROM account
@@ -562,7 +562,7 @@ def initialize_database():
                         """
                     ).fetchone()
                 else:
-                    legacy_account = connection.execute(
+                    old_account = connection.execute(
                         """
                         SELECT *
                         FROM account
@@ -571,10 +571,10 @@ def initialize_database():
                         """
                     ).fetchone()
 
-                if legacy_account is not None:
+                if old_account is not None:
                     cash_balance = float(
                         row_value(
-                            legacy_account,
+                            old_account,
                             "balance",
                             STARTING_BALANCE,
                         )
@@ -582,7 +582,7 @@ def initialize_database():
 
                     realized_pnl = float(
                         row_value(
-                            legacy_account,
+                            old_account,
                             "realized_pnl",
                             0.0,
                         )
@@ -590,7 +590,7 @@ def initialize_database():
 
                     cycle_number = int(
                         row_value(
-                            legacy_account,
+                            old_account,
                             "cycle",
                             1,
                         )
@@ -620,320 +620,6 @@ def initialize_database():
             ),
         )
 
-    # --------------------------------------------------------
-    # POSITION MIGRATION
-    # --------------------------------------------------------
-    replay_position_exists = cursor.execute(
-        """
-        SELECT account_id
-        FROM replay_positions
-        WHERE account_id = ?
-        """,
-        (ACCOUNT_ID,),
-    ).fetchone()
-
-    if (
-        replay_position_exists is None
-        and table_exists(connection, "positions")
-    ):
-        columns = table_columns(connection, "positions")
-
-        try:
-            if "account_id" in columns:
-                legacy_position = connection.execute(
-                    """
-                    SELECT *
-                    FROM positions
-                    WHERE account_id = ?
-                    LIMIT 1
-                    """,
-                    (ACCOUNT_ID,),
-                ).fetchone()
-            else:
-                legacy_position = connection.execute(
-                    """
-                    SELECT *
-                    FROM positions
-                    LIMIT 1
-                    """
-                ).fetchone()
-
-            if legacy_position is not None:
-                if "quantity" in columns:
-                    raw_quantity = float(
-                        row_value(
-                            legacy_position,
-                            "quantity",
-                            0.0,
-                        )
-                    )
-                else:
-                    raw_quantity = float(
-                        row_value(
-                            legacy_position,
-                            "qty",
-                            0.0,
-                        )
-                    )
-
-                if abs(raw_quantity) > 1e-12:
-                    legacy_side = row_value(
-                        legacy_position,
-                        "side",
-                        None,
-                    )
-
-                    if legacy_side not in {"long", "short"}:
-                        legacy_side = (
-                            "long"
-                            if raw_quantity > 0
-                            else "short"
-                        )
-
-                    quantity = abs(raw_quantity)
-
-                    ticker_value = str(
-                        row_value(
-                            legacy_position,
-                            "ticker",
-                            "MIXED",
-                        )
-                    )
-
-                    entry_price = float(
-                        row_value(
-                            legacy_position,
-                            "entry_price",
-                            0.0,
-                        )
-                    )
-
-                    stop_loss = row_value(
-                        legacy_position,
-                        "stop_loss",
-                        row_value(
-                            legacy_position,
-                            "sl",
-                            None,
-                        ),
-                    )
-
-                    target = row_value(
-                        legacy_position,
-                        "target",
-                        row_value(
-                            legacy_position,
-                            "tp",
-                            None,
-                        ),
-                    )
-
-                    if stop_loss == -1:
-                        stop_loss = None
-
-                    if target == -1:
-                        target = None
-
-                    cursor.execute(
-                        """
-                        INSERT INTO replay_positions (
-                            account_id,
-                            ticker,
-                            asset_class,
-                            side,
-                            quantity,
-                            entry_price,
-                            entry_time,
-                            stop_loss,
-                            target,
-                            invested_amount,
-                            last_mark_price,
-                            last_mark_time
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            ACCOUNT_ID,
-                            ticker_value,
-                            detect_asset_class(ticker_value),
-                            legacy_side,
-                            quantity,
-                            entry_price,
-                            str(
-                                row_value(
-                                    legacy_position,
-                                    "entry_time",
-                                    now,
-                                )
-                            ),
-                            stop_loss,
-                            target,
-                            quantity * entry_price,
-                            entry_price,
-                            now,
-                        ),
-                    )
-
-        except Exception:
-            # Legacy migration is best-effort only.
-            pass
-
-    # --------------------------------------------------------
-    # TRADE MIGRATION
-    # --------------------------------------------------------
-    existing_replay_trades = cursor.execute(
-        """
-        SELECT COUNT(*)
-        FROM replay_trades
-        """
-    ).fetchone()[0]
-
-    if (
-        existing_replay_trades == 0
-        and table_exists(connection, "trades")
-    ):
-        columns = table_columns(connection, "trades")
-
-        if {
-            "ticker",
-            "entry_price",
-        }.issubset(columns):
-            try:
-                legacy_trades = connection.execute(
-                    """
-                    SELECT *
-                    FROM trades
-                    ORDER BY id ASC
-                    """
-                ).fetchall()
-
-                for legacy_trade in legacy_trades:
-                    exit_price = row_value(
-                        legacy_trade,
-                        "exit_price",
-                        None,
-                    )
-
-                    if exit_price is None:
-                        continue
-
-                    quantity = float(
-                        row_value(
-                            legacy_trade,
-                            "quantity",
-                            row_value(
-                                legacy_trade,
-                                "qty",
-                                0.0,
-                            ),
-                        )
-                    )
-
-                    side = row_value(
-                        legacy_trade,
-                        "side",
-                        "long",
-                    )
-
-                    if quantity < 0:
-                        quantity = abs(quantity)
-                        side = "short"
-
-                    ticker_value = str(
-                        row_value(
-                            legacy_trade,
-                            "ticker",
-                            "UNKNOWN",
-                        )
-                    )
-
-                    cursor.execute(
-                        """
-                        INSERT INTO replay_trades (
-                            account_id,
-                            cycle_number,
-                            ticker,
-                            asset_class,
-                            side,
-                            quantity,
-                            entry_price,
-                            exit_price,
-                            entry_time,
-                            exit_time,
-                            realized_pnl,
-                            fees,
-                            reason
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            ACCOUNT_ID,
-                            int(
-                                row_value(
-                                    legacy_trade,
-                                    "cycle_number",
-                                    1,
-                                )
-                            ),
-                            ticker_value,
-                            str(
-                                row_value(
-                                    legacy_trade,
-                                    "asset_class",
-                                    detect_asset_class(ticker_value),
-                                )
-                            ),
-                            side,
-                            abs(quantity),
-                            float(
-                                row_value(
-                                    legacy_trade,
-                                    "entry_price",
-                                    0.0,
-                                )
-                            ),
-                            float(exit_price),
-                            str(
-                                row_value(
-                                    legacy_trade,
-                                    "entry_time",
-                                    "",
-                                )
-                            ),
-                            str(
-                                row_value(
-                                    legacy_trade,
-                                    "exit_time",
-                                    "",
-                                )
-                            ),
-                            float(
-                                row_value(
-                                    legacy_trade,
-                                    "realized_pnl",
-                                    0.0,
-                                )
-                            ),
-                            float(
-                                row_value(
-                                    legacy_trade,
-                                    "fees",
-                                    0.0,
-                                )
-                            ),
-                            str(
-                                row_value(
-                                    legacy_trade,
-                                    "reason",
-                                    "",
-                                )
-                            ),
-                        ),
-                    )
-
-            except Exception:
-                pass
-
     connection.commit()
     connection.close()
 
@@ -951,6 +637,16 @@ def load_account():
     ).fetchone()
 
     connection.close()
+
+    if row is None:
+        return {
+            "account_id": ACCOUNT_ID,
+            "starting_balance": STARTING_BALANCE,
+            "cash_balance": STARTING_BALANCE,
+            "realized_pnl": 0.0,
+            "cycle_number": 1,
+        }
+
     return dict(row)
 
 
@@ -1138,7 +834,11 @@ def save_trade(
     connection.close()
 
 
-def save_account_event(event_type, message, cycle_number=None):
+def save_account_event(
+    event_type,
+    message,
+    cycle_number=None,
+):
     account = load_account()
 
     if cycle_number is None:
@@ -1177,10 +877,7 @@ def reset_account_cycle():
 
     save_account_event(
         "ACCOUNT_DEPLETED",
-        (
-            f"Account cycle {old_cycle} ended after equity "
-            f"depletion."
-        ),
+        f"Account cycle {old_cycle} ended after equity depletion.",
         cycle_number=old_cycle,
     )
 
@@ -1219,10 +916,7 @@ def reset_account_cycle():
 
     save_account_event(
         "NEW_ACCOUNT_CYCLE",
-        (
-            f"New paper account cycle funded with "
-            f"${STARTING_BALANCE:.2f}."
-        ),
+        f"New paper account funded with ${STARTING_BALANCE:.2f}.",
         cycle_number=new_cycle,
     )
 
@@ -1230,7 +924,11 @@ def reset_account_cycle():
 # ============================================================
 # PERSISTENT DRAWINGS
 # ============================================================
-def add_persistent_drawing(ticker, drawing_type, payload):
+def add_persistent_drawing(
+    ticker,
+    drawing_type,
+    payload,
+):
     if not ticker:
         return
 
@@ -1352,11 +1050,13 @@ def clear_persistent_drawings(ticker):
     connection.close()
 
 
-def add_horizontal_line(price, label="", color="#22d3ee"):
-    active_ticker = st.session_state.active_ticker
-
+def add_horizontal_line(
+    price,
+    label="",
+    color="#22d3ee",
+):
     add_persistent_drawing(
-        active_ticker,
+        st.session_state.active_ticker,
         "hline",
         {
             "price": float(price),
@@ -1367,10 +1067,8 @@ def add_horizontal_line(price, label="", color="#22d3ee"):
 
 
 def add_band(price_1, price_2):
-    active_ticker = st.session_state.active_ticker
-
     add_persistent_drawing(
-        active_ticker,
+        st.session_state.active_ticker,
         "band",
         {
             "y0": min(float(price_1), float(price_2)),
@@ -1382,10 +1080,8 @@ def add_band(price_1, price_2):
 
 
 def add_trend_line(x0, y0, x1, y1):
-    active_ticker = st.session_state.active_ticker
-
     add_persistent_drawing(
-        active_ticker,
+        st.session_state.active_ticker,
         "trend",
         {
             "x0": str(pd.Timestamp(x0)),
@@ -1398,7 +1094,7 @@ def add_trend_line(x0, y0, x1, y1):
 
 
 # ============================================================
-# MARKET CALENDAR HELPERS
+# MARKET CALENDAR
 # ============================================================
 def nth_weekday(year, month, weekday, occurrence):
     first_day = date(year, month, 1)
@@ -1448,9 +1144,7 @@ def calculate_easter(year):
     m = (a + 11 * h + 22 * l) // 451
 
     month = (h + l - 7 * m + 114) // 31
-    day_value = (
-        (h + l - 7 * m + 114) % 31
-    ) + 1
+    day_value = ((h + l - 7 * m + 114) % 31) + 1
 
     return date(year, month, day_value)
 
@@ -1482,10 +1176,7 @@ def is_us_market_holiday(day_value):
     if day_value is None:
         return False
 
-    return (
-        day_value
-        in us_market_holidays(day_value.year)
-    )
+    return day_value in us_market_holidays(day_value.year)
 
 
 def is_early_close(day_value):
@@ -1498,30 +1189,29 @@ def is_early_close(day_value):
 
     return day_value in {
         date(year, 7, 3),
-        nth_weekday(year, 11, 3, 4)
-        + timedelta(days=1),
+        nth_weekday(year, 11, 3, 4) + timedelta(days=1),
         date(year, 12, 24),
     }
 
 
 def futures_session_date(timestamp):
     timestamp = pd.Timestamp(timestamp)
-    result = timestamp.date()
+    session_date = timestamp.date()
 
     if timestamp.time() >= time(18, 0):
-        result += timedelta(days=1)
+        session_date += timedelta(days=1)
 
-    return result
+    return session_date
 
 
 def forex_session_date(timestamp):
     timestamp = pd.Timestamp(timestamp)
-    result = timestamp.date()
+    session_date = timestamp.date()
 
     if timestamp.time() >= time(17, 0):
-        result += timedelta(days=1)
+        session_date += timedelta(days=1)
 
-    return result
+    return session_date
 
 
 # ============================================================
@@ -1546,10 +1236,7 @@ def normalize_ohlcv(raw, intraday=True):
 
     dataframe = raw.copy()
 
-    if isinstance(
-        dataframe.columns,
-        pd.MultiIndex,
-    ):
+    if isinstance(dataframe.columns, pd.MultiIndex):
         dataframe.columns = [
             str(column[0])
             for column in dataframe.columns
@@ -1557,30 +1244,14 @@ def normalize_ohlcv(raw, intraday=True):
 
     dataframe = dataframe.reset_index()
 
-    open_column = find_column(
-        dataframe,
-        ["Open"],
-    )
-
-    high_column = find_column(
-        dataframe,
-        ["High"],
-    )
-
-    low_column = find_column(
-        dataframe,
-        ["Low"],
-    )
-
+    open_column = find_column(dataframe, ["Open"])
+    high_column = find_column(dataframe, ["High"])
+    low_column = find_column(dataframe, ["Low"])
     close_column = find_column(
         dataframe,
         ["Close", "Adj Close"],
     )
-
-    volume_column = find_column(
-        dataframe,
-        ["Volume"],
-    )
+    volume_column = find_column(dataframe, ["Volume"])
 
     if any(
         column is None
@@ -1595,9 +1266,7 @@ def normalize_ohlcv(raw, intraday=True):
 
     output = pd.DataFrame(
         {
-            "timestamp": dataframe[
-                dataframe.columns[0]
-            ],
+            "timestamp": dataframe[dataframe.columns[0]],
             "open": dataframe[open_column],
             "high": dataframe[high_column],
             "low": dataframe[low_column],
@@ -1637,10 +1306,7 @@ def normalize_ohlcv(raw, intraday=True):
             errors="coerce",
         )
 
-    output["volume"] = (
-        output["volume"]
-        .fillna(0.0)
-    )
+    output["volume"] = output["volume"].fillna(0.0)
 
     output = output.dropna(
         subset=[
@@ -1677,9 +1343,7 @@ def normalize_ohlcv(raw, intraday=True):
     if output.empty:
         return pd.DataFrame()
 
-    output["bar_ratio"] = (
-        output["high"] / output["low"]
-    )
+    output["bar_ratio"] = output["high"] / output["low"]
 
     output = output[
         output["bar_ratio"] <= 3.0
@@ -1690,10 +1354,7 @@ def normalize_ohlcv(raw, intraday=True):
 
     rolling_median = (
         output["close"]
-        .rolling(
-            80,
-            min_periods=10,
-        )
+        .rolling(80, min_periods=10)
         .median()
         .shift(1)
     )
@@ -1710,16 +1371,13 @@ def normalize_ohlcv(raw, intraday=True):
         .replace(0, np.nan)
     )
 
-    price_ratio = (
-        output["close"] / reference
-    )
+    price_ratio = output["close"] / reference
 
     if intraday:
         output = output[
             (price_ratio >= 0.10)
             & (price_ratio <= 10.0)
         ].copy()
-
     else:
         output = output[
             (price_ratio >= 0.02)
@@ -1748,19 +1406,15 @@ def normalize_ohlcv(raw, intraday=True):
 def fetch_history(ticker, timeframe):
     configuration = TIMEFRAME_CONFIG[timeframe]
 
-    periods_to_try = [
+    for period in [
         configuration["period"],
         configuration["fallback_period"],
-    ]
-
-    for period in periods_to_try:
+    ]:
         try:
             raw = yf.download(
                 ticker,
                 period=period,
-                interval=configuration[
-                    "yf_interval"
-                ],
+                interval=configuration["yf_interval"],
                 auto_adjust=True,
                 progress=False,
                 prepost=True,
@@ -1769,9 +1423,7 @@ def fetch_history(ticker, timeframe):
 
             dataframe = normalize_ohlcv(
                 raw,
-                intraday=configuration[
-                    "intraday"
-                ],
+                intraday=configuration["intraday"],
             )
 
             if not dataframe.empty:
@@ -1797,7 +1449,6 @@ def apply_session_filter(
         output["timestamp"]
     )
 
-    # Daily bars do not have meaningful intraday timestamps.
     if not intraday:
         if session_mode in {
             "US Stocks / ETFs - Regular Hours",
@@ -1822,32 +1473,16 @@ def apply_session_filter(
             ].copy()
 
         output["session_date"] = (
-            output["calendar_date"]
-            .map(to_pydate)
+            output["calendar_date"].map(to_pydate)
         )
 
         return output.reset_index(drop=True)
 
-    minutes = (
-        output["timestamp"].dt.hour * 60
-        + output["timestamp"].dt.minute
-    )
+    weekday = output["timestamp"].dt.weekday
+    timestamp_time = output["timestamp"].dt.time
 
-    weekday = output[
-        "timestamp"
-    ].dt.weekday
-
-    timestamp_time = output[
-        "timestamp"
-    ].dt.time
-
-    if (
-        session_mode
-        == "US Stocks / ETFs - Regular Hours"
-    ):
-        output = output[
-            weekday < 5
-        ].copy()
+    if session_mode == "US Stocks / ETFs - Regular Hours":
+        output = output[weekday < 5].copy()
 
         output = output[
             ~output["calendar_date"].apply(
@@ -1874,17 +1509,11 @@ def apply_session_filter(
         ].copy()
 
         output["session_date"] = (
-            output["calendar_date"]
-            .map(to_pydate)
+            output["calendar_date"].map(to_pydate)
         )
 
-    elif (
-        session_mode
-        == "US Stocks / ETFs - Extended Hours"
-    ):
-        output = output[
-            weekday < 5
-        ].copy()
+    elif session_mode == "US Stocks / ETFs - Extended Hours":
+        output = output[weekday < 5].copy()
 
         output = output[
             ~output["calendar_date"].apply(
@@ -1903,19 +1532,15 @@ def apply_session_filter(
         ].copy()
 
         output["session_date"] = (
-            output["calendar_date"]
-            .map(to_pydate)
+            output["calendar_date"].map(to_pydate)
         )
 
     elif session_mode == "CME Futures":
-        # Sunday: 18:00 onward
         sunday_valid = (
             (weekday == 6)
             & (timestamp_time >= time(18, 0))
         )
 
-        # Monday through Thursday:
-        # everything except 17:00-18:00
         monday_thursday_valid = (
             (weekday >= 0)
             & (weekday <= 3)
@@ -1925,7 +1550,6 @@ def apply_session_filter(
             )
         )
 
-        # Friday: before 17:00 only
         friday_valid = (
             (weekday == 4)
             & (timestamp_time < time(17, 0))
@@ -1938,8 +1562,9 @@ def apply_session_filter(
         ].copy()
 
         output["session_date"] = (
-            output["timestamp"]
-            .apply(futures_session_date)
+            output["timestamp"].apply(
+                futures_session_date
+            )
         )
 
     elif session_mode == "Forex 24/5":
@@ -1965,25 +1590,23 @@ def apply_session_filter(
         ].copy()
 
         output["session_date"] = (
-            output["timestamp"]
-            .apply(forex_session_date)
+            output["timestamp"].apply(
+                forex_session_date
+            )
         )
 
     elif session_mode == "Crypto 24/7":
         output["session_date"] = (
-            output["calendar_date"]
-            .map(to_pydate)
+            output["calendar_date"].map(to_pydate)
         )
 
     else:
         output["session_date"] = (
-            output["calendar_date"]
-            .map(to_pydate)
+            output["calendar_date"].map(to_pydate)
         )
 
     output["session_date"] = (
-        output["session_date"]
-        .map(to_pydate)
+        output["session_date"].map(to_pydate)
     )
 
     return (
@@ -2031,8 +1654,7 @@ def apply_custom_session(
         ].copy()
 
         output["session_date"] = (
-            output["calendar_date"]
-            .map(to_pydate)
+            output["calendar_date"].map(to_pydate)
         )
 
     else:
@@ -2051,8 +1673,9 @@ def apply_custom_session(
             return result
 
         output["session_date"] = (
-            output["timestamp"]
-            .apply(custom_session_date)
+            output["timestamp"].apply(
+                custom_session_date
+            )
         )
 
     return output.reset_index(drop=True)
@@ -2114,11 +1737,9 @@ def get_context_dataframe(
         current_session_date
     )
 
-    previous_sessions = (
-        previous_sessions_map.get(
-            preset,
-            0,
-        )
+    previous_sessions = previous_sessions_map.get(
+        preset,
+        0,
     )
 
     start_index = max(
@@ -2126,9 +1747,7 @@ def get_context_dataframe(
         current_index - previous_sessions,
     )
 
-    start_session = session_dates[
-        start_index
-    ]
+    start_session = session_dates[start_index]
 
     return revealed_dataframe[
         session_series >= start_session
@@ -2139,14 +1758,14 @@ def build_chart_dataframe(
     calculated_dataframe,
     current_session_date,
     context_preset,
-    continuous,
+    continuous_market,
     follow_enabled,
     follow_bar_count,
 ):
     if calculated_dataframe.empty:
         return calculated_dataframe.copy()
 
-    if continuous and follow_enabled:
+    if continuous_market and follow_enabled:
         return (
             calculated_dataframe
             .tail(int(follow_bar_count))
@@ -2262,26 +1881,13 @@ def compute_five_session_sr(
     current_price,
     max_levels=6,
 ):
-    """
-    Uses five COMPLETED trading sessions.
-
-    The current partial session is deliberately excluded.
-    Nearby session highs/lows are clustered into one level.
-
-    Returns:
-        levels
-        completed_sessions_used
-        merge_tolerance
-    """
-
     if revealed_dataframe.empty:
         return [], [], 0.0
 
     working = revealed_dataframe.copy()
 
     working["_session"] = (
-        working["session_date"]
-        .map(to_pydate)
+        working["session_date"].map(to_pydate)
     )
 
     working = working.dropna(
@@ -2295,17 +1901,14 @@ def compute_five_session_sr(
     completed_session_dates = sorted(
         {
             session_date
-            for session_date
-            in working["_session"].unique()
+            for session_date in working["_session"].unique()
             if session_date < current_session_date
         }
     )
 
-    selected_sessions = (
-        completed_session_dates[
-            -AUTO_SR_LOOKBACK_SESSIONS:
-        ]
-    )
+    selected_sessions = completed_session_dates[
+        -AUTO_SR_LOOKBACK_SESSIONS:
+    ]
 
     if not selected_sessions:
         return [], [], 0.0
@@ -2313,14 +1916,12 @@ def compute_five_session_sr(
     candidates = []
     session_ranges = []
 
-    # selected_sessions is oldest -> newest
     for sequence, session_date_value in enumerate(
         selected_sessions,
         start=1,
     ):
         session_rows = working[
-            working["_session"]
-            == session_date_value
+            working["_session"] == session_date_value
         ]
 
         if session_rows.empty:
@@ -2371,9 +1972,6 @@ def compute_five_session_sr(
         else 0.0
     )
 
-    # Merge prices that represent effectively the same area.
-    # Percentage prevents micro pivots from becoming separate lines.
-    # Session-range component adapts to volatile instruments.
     merge_tolerance = max(
         abs(float(current_price)) * 0.0015,
         median_session_range * 0.08,
@@ -2402,25 +2000,18 @@ def compute_five_session_sr(
             np.median(
                 [
                     item["price"]
-                    for item
-                    in previous_cluster[
-                        "candidates"
-                    ]
+                    for item in previous_cluster["candidates"]
                 ]
             )
         )
 
         if (
-            abs(
-                candidate["price"]
-                - cluster_center
-            )
+            abs(candidate["price"] - cluster_center)
             <= merge_tolerance
         ):
-            previous_cluster[
-                "candidates"
-            ].append(candidate)
-
+            previous_cluster["candidates"].append(
+                candidate
+            )
         else:
             clusters.append(
                 {
@@ -2430,12 +2021,8 @@ def compute_five_session_sr(
 
     levels = []
 
-    for cluster_index, cluster in enumerate(
-        clusters
-    ):
-        cluster_candidates = cluster[
-            "candidates"
-        ]
+    for cluster_index, cluster in enumerate(clusters):
+        cluster_candidates = cluster["candidates"]
 
         cluster_prices = [
             item["price"]
@@ -2467,23 +2054,16 @@ def compute_five_session_sr(
             {
                 "cluster_index": cluster_index,
                 "price": center_price,
-                "zone_low": float(
-                    min(cluster_prices)
-                ),
-                "zone_high": float(
-                    max(cluster_prices)
-                ),
-                "touches": len(
-                    cluster_candidates
-                ),
+                "zone_low": float(min(cluster_prices)),
+                "zone_high": float(max(cluster_prices)),
+                "touches": len(cluster_candidates),
                 "high_count": high_count,
                 "low_count": low_count,
                 "recency_score": recency_score,
                 "sessions": sorted(
                     {
                         item["session"]
-                        for item
-                        in cluster_candidates
+                        for item in cluster_candidates
                     }
                 ),
             }
@@ -2523,24 +2103,19 @@ def compute_five_session_sr(
             mandatory_indices.add(level_index)
 
         if any(
-            item["session"]
-            == most_recent_session
+            item["session"] == most_recent_session
             for item in cluster_candidates
         ):
             mandatory_indices.add(level_index)
 
     def importance(level):
         distance = abs(
-            level["price"]
-            - float(current_price)
+            level["price"] - float(current_price)
         )
 
         normalized_distance = (
             distance
-            / max(
-                abs(float(current_price)),
-                1e-12,
-            )
+            / max(abs(float(current_price)), 1e-12)
         )
 
         return (
@@ -2551,9 +2126,7 @@ def compute_five_session_sr(
 
     ranked_indices = sorted(
         range(len(levels)),
-        key=lambda index: importance(
-            levels[index]
-        ),
+        key=lambda index: importance(levels[index]),
         reverse=True,
     )
 
@@ -2602,8 +2175,7 @@ def get_developing_session_levels(
     )
 
     session_rows = revealed_dataframe[
-        revealed_dataframe["session_date"]
-        .map(to_pydate)
+        revealed_dataframe["session_date"].map(to_pydate)
         == current_session_date
     ]
 
@@ -2611,12 +2183,8 @@ def get_developing_session_levels(
         return None
 
     return {
-        "high": float(
-            session_rows["high"].max()
-        ),
-        "low": float(
-            session_rows["low"].min()
-        ),
+        "high": float(session_rows["high"].max()),
+        "low": float(session_rows["low"].min()),
         "bars": len(session_rows),
     }
 
@@ -2627,8 +2195,7 @@ def get_developing_session_levels(
 def raw_swings(dataframe):
     if (
         dataframe is None
-        or len(dataframe)
-        < SWING_K * 2 + 1
+        or len(dataframe) < SWING_K * 2 + 1
     ):
         return []
 
@@ -2662,10 +2229,8 @@ def raw_swings(dataframe):
         ]
 
         if (
-            highs[index]
-            == high_window.max()
-            and highs[index]
-            - low_window.min()
+            highs[index] == high_window.max()
+            and highs[index] - low_window.min()
             >= minimum_size
         ):
             raw.append(
@@ -2677,10 +2242,8 @@ def raw_swings(dataframe):
             )
 
         if (
-            lows[index]
-            == low_window.min()
-            and high_window.max()
-            - lows[index]
+            lows[index] == low_window.min()
+            and high_window.max() - lows[index]
             >= minimum_size
         ):
             raw.append(
@@ -2698,8 +2261,7 @@ def raw_swings(dataframe):
     for swing in raw:
         if (
             cleaned
-            and cleaned[-1][2]
-            == swing[2]
+            and cleaned[-1][2] == swing[2]
         ):
             previous = cleaned[-1]
 
@@ -2714,7 +2276,6 @@ def raw_swings(dataframe):
                 and swing[1] <= previous[1]
             ):
                 cleaned[-1] = swing
-
         else:
             cleaned.append(swing)
 
@@ -2766,16 +2327,12 @@ def build_local_zones(
 
         for zone in zones:
             distance = abs(
-                swing["price"]
-                - zone["mid"]
+                swing["price"] - zone["mid"]
             )
 
             normalized_distance = (
                 distance
-                / max(
-                    reference_price,
-                    1e-12,
-                )
+                / max(reference_price, 1e-12)
             )
 
             if normalized_distance < ZONE_TOL:
@@ -2801,9 +2358,7 @@ def build_local_zones(
             zones.append(
                 {
                     "mid": swing["price"],
-                    "prices": [
-                        swing["price"]
-                    ],
+                    "prices": [swing["price"]],
                     "touches": 1,
                     "low_touches": (
                         1
@@ -2821,18 +2376,12 @@ def build_local_zones(
     output = [
         zone
         for zone in zones
-        if zone["touches"]
-        >= MIN_DRAW_TOUCHES
+        if zone["touches"] >= MIN_DRAW_TOUCHES
     ]
 
     for zone in output:
-        zone["min_px"] = min(
-            zone["prices"]
-        )
-
-        zone["max_px"] = max(
-            zone["prices"]
-        )
+        zone["min_px"] = min(zone["prices"])
+        zone["max_px"] = max(zone["prices"])
 
     return output
 
@@ -2855,21 +2404,17 @@ def detect_bos_choch(
     for index in range(len(dataframe)):
         while (
             pointer < len(labeled_swings)
-            and labeled_swings[pointer]["i"]
-            + SWING_K
+            and labeled_swings[pointer]["i"] + SWING_K
             <= index
         ):
             swing = labeled_swings[pointer]
 
             if swing["label"] == "HH":
                 last_hh = swing["price"]
-
             elif swing["label"] == "HL":
                 last_hl = swing["price"]
-
             elif swing["label"] == "LH":
                 last_lh = swing["price"]
-
             elif swing["label"] == "LL":
                 last_ll = swing["price"]
 
@@ -2958,15 +2503,13 @@ def local_zone_role(
 ):
     if (
         zone["low_touches"]
-        >= zone["high_touches"]
-        + POLARITY_EDGE
+        >= zone["high_touches"] + POLARITY_EDGE
     ):
         role = "floor"
 
     elif (
         zone["high_touches"]
-        >= zone["low_touches"]
-        + POLARITY_EDGE
+        >= zone["low_touches"] + POLARITY_EDGE
     ):
         role = "ceiling"
 
@@ -2975,15 +2518,13 @@ def local_zone_role(
 
     if (
         role == "floor"
-        and close_price
-        < zone["min_px"] - noise
+        and close_price < zone["min_px"] - noise
     ):
         return "broken_floor"
 
     if (
         role == "ceiling"
-        and close_price
-        > zone["max_px"] + noise
+        and close_price > zone["max_px"] + noise
     ):
         return "broken_ceiling"
 
@@ -2999,6 +2540,10 @@ def add_badge(
     y_shift=0,
     arrow=False,
 ):
+    """
+    Used only for candle-specific market-structure labels.
+    These labels stay next to the swing candle.
+    """
     figure.add_annotation(
         x=x_value,
         y=y_value,
@@ -3024,6 +2569,43 @@ def add_badge(
     )
 
 
+def add_rail_label(
+    figure,
+    x_value,
+    y_value,
+    text,
+    background_color,
+    foreground_color="#ffffff",
+    border_color="#e5e7eb",
+    font_size=9,
+):
+    """
+    Places an S/R label in the dedicated right-side rail.
+    The corresponding horizontal line remains at the exact price.
+    """
+    figure.add_annotation(
+        x=x_value,
+        y=float(y_value),
+        row=1,
+        col=1,
+        xanchor="left",
+        yanchor="middle",
+        text=f"<b>{text}</b>",
+        showarrow=False,
+        font={
+            "size": font_size,
+            "color": foreground_color,
+            "family": "Arial",
+        },
+        bgcolor=background_color,
+        bordercolor=border_color,
+        borderwidth=1,
+        borderpad=3,
+        opacity=0.94,
+        align="left",
+    )
+
+
 # ============================================================
 # TRADING
 # ============================================================
@@ -3036,9 +2618,7 @@ def add_marker(
     st.session_state.markers.append(
         {
             "ticker": ticker,
-            "timestamp": pd.Timestamp(
-                timestamp
-            ),
+            "timestamp": pd.Timestamp(timestamp),
             "price": float(price),
             "kind": marker_type,
         }
@@ -3056,9 +2636,7 @@ def open_position(
 ):
     account = load_account()
 
-    quantity = (
-        float(amount) / float(price)
-    )
+    quantity = float(amount) / float(price)
 
     cash_balance = float(
         account["cash_balance"]
@@ -3077,9 +2655,7 @@ def open_position(
     save_position(
         {
             "ticker": ticker,
-            "asset_class": detect_asset_class(
-                ticker
-            ),
+            "asset_class": detect_asset_class(ticker),
             "side": side,
             "quantity": quantity,
             "entry_price": float(price),
@@ -3174,22 +2750,14 @@ def close_position(
         save_position(None)
 
     else:
-        position["quantity"] = (
-            remaining_quantity
-        )
+        position["quantity"] = remaining_quantity
 
         position["invested_amount"] = (
-            remaining_quantity
-            * entry_price
+            remaining_quantity * entry_price
         )
 
-        position["last_mark_price"] = (
-            exit_price
-        )
-
-        position["last_mark_time"] = str(
-            timestamp
-        )
+        position["last_mark_price"] = exit_price
+        position["last_mark_time"] = str(timestamp)
 
         save_position(position)
 
@@ -3205,23 +2773,19 @@ def calculate_account_values(
     if position is None:
         return {
             "cash": cash_balance,
-            "signed_position_value": 0.0,
             "display_position_value": 0.0,
+            "signed_position_value": 0.0,
             "equity": cash_balance,
             "unrealized_pnl": 0.0,
             "signed_quantity": 0.0,
         }
 
-    quantity = float(
-        position["quantity"]
-    )
+    quantity = float(position["quantity"])
+    mark_price = float(position["last_mark_price"])
+    entry_price = float(position["entry_price"])
 
-    mark_price = float(
-        position["last_mark_price"]
-    )
-
-    entry_price = float(
-        position["entry_price"]
+    display_position_value = (
+        quantity * mark_price
     )
 
     if position["side"] == "long":
@@ -3253,12 +2817,8 @@ def calculate_account_values(
 
     return {
         "cash": cash_balance,
-        "signed_position_value": (
-            signed_position_value
-        ),
-        "display_position_value": (
-            signed_position_value
-        ),
+        "display_position_value": display_position_value,
+        "signed_position_value": signed_position_value,
         "equity": equity,
         "unrealized_pnl": unrealized_pnl,
         "signed_quantity": signed_quantity,
@@ -3277,10 +2837,7 @@ def maybe_reset_depleted_account():
         reset_account_cycle()
 
         st.toast(
-            (
-                "Account depleted. A new "
-                "$1,000 account cycle started."
-            ),
+            "Account depleted. A new $1,000 account cycle started.",
             icon="⚠️",
         )
 
@@ -3342,22 +2899,13 @@ def advance_bars(number_of_bars):
     if dataframe.empty:
         return
 
-    active_ticker = (
-        st.session_state.active_ticker
-    )
-
+    active_ticker = st.session_state.active_ticker
     maximum_step = len(dataframe) - 1
 
     for _ in range(int(number_of_bars)):
-        if (
-            st.session_state.step
-            >= maximum_step
-        ):
+        if st.session_state.step >= maximum_step:
             st.toast(
-                (
-                    "End of available Yahoo "
-                    "history reached."
-                ),
+                "End of available Yahoo history reached.",
                 icon="🔔",
             )
             break
@@ -3380,23 +2928,14 @@ def advance_bars(number_of_bars):
 
         position_is_active = (
             position is not None
-            and position["ticker"]
-            == active_ticker
+            and position["ticker"] == active_ticker
         )
 
-        # Force close only at an actual trading-session
-        # boundary, and only when carry is disabled.
         if (
             position_is_active
-            and not st.session_state[
-                "active_carry_mode"
-            ]
-            and to_pydate(
-                previous_row["session_date"]
-            )
-            != to_pydate(
-                row["session_date"]
-            )
+            and not st.session_state.active_carry_mode
+            and to_pydate(previous_row["session_date"])
+            != to_pydate(row["session_date"])
         ):
             execution_price = float(
                 previous_row["close"]
@@ -3425,19 +2964,13 @@ def advance_bars(number_of_bars):
             position_is_active = False
 
         if position_is_active:
-            stop_loss = position[
-                "stop_loss"
-            ]
-
-            target = position[
-                "target"
-            ]
+            stop_loss = position["stop_loss"]
+            target = position["target"]
 
             if position["side"] == "long":
                 if (
                     stop_loss is not None
-                    and float(row["low"])
-                    <= float(stop_loss)
+                    and float(row["low"]) <= float(stop_loss)
                 ):
                     execution_price = min(
                         float(stop_loss),
@@ -3458,19 +2991,14 @@ def advance_bars(number_of_bars):
                     )
 
                     st.toast(
-                        (
-                            "Long stopped at "
-                            f"{format_price(execution_price)}"
-                        ),
+                        f"Long stopped at {format_price(execution_price)}",
                         icon="💥",
                     )
-
                     break
 
                 if (
                     target is not None
-                    and float(row["high"])
-                    >= float(target)
+                    and float(row["high"]) >= float(target)
                 ):
                     execution_price = max(
                         float(target),
@@ -3491,20 +3019,15 @@ def advance_bars(number_of_bars):
                     )
 
                     st.toast(
-                        (
-                            "Long target hit at "
-                            f"{format_price(execution_price)}"
-                        ),
+                        f"Long target hit at {format_price(execution_price)}",
                         icon="🎉",
                     )
-
                     break
 
             else:
                 if (
                     stop_loss is not None
-                    and float(row["high"])
-                    >= float(stop_loss)
+                    and float(row["high"]) >= float(stop_loss)
                 ):
                     execution_price = max(
                         float(stop_loss),
@@ -3525,19 +3048,14 @@ def advance_bars(number_of_bars):
                     )
 
                     st.toast(
-                        (
-                            "Short stopped at "
-                            f"{format_price(execution_price)}"
-                        ),
+                        f"Short stopped at {format_price(execution_price)}",
                         icon="💥",
                     )
-
                     break
 
                 if (
                     target is not None
-                    and float(row["low"])
-                    <= float(target)
+                    and float(row["low"]) <= float(target)
                 ):
                     execution_price = min(
                         float(target),
@@ -3558,13 +3076,9 @@ def advance_bars(number_of_bars):
                     )
 
                     st.toast(
-                        (
-                            "Short target hit at "
-                            f"{format_price(execution_price)}"
-                        ),
+                        f"Short target hit at {format_price(execution_price)}",
                         icon="🎉",
                     )
-
                     break
 
         check_account_depletion(
@@ -3586,10 +3100,8 @@ def extract_selected_points(chart_event):
     try:
         return [
             dict(point)
-            for point
-            in chart_event.selection.points
+            for point in chart_event.selection.points
         ]
-
     except Exception:
         pass
 
@@ -3599,7 +3111,6 @@ def extract_selected_points(chart_event):
             .get("selection", {})
             .get("points", [])
         )
-
     except Exception:
         return []
 
@@ -3619,14 +3130,13 @@ def nearest_row_from_event(
                 round(float(x_value))
             )
 
-            if (
-                0
-                <= selected_index
-                < len(dataframe)
-            ):
-                return dataframe.iloc[
-                    selected_index
-                ]
+            matching_rows = dataframe[
+                dataframe["x_index"]
+                == selected_index
+            ]
+
+            if not matching_rows.empty:
+                return matching_rows.iloc[0]
 
         except Exception:
             pass
@@ -3640,14 +3150,8 @@ def nearest_row_from_event(
         try:
             point_index = int(point_index)
 
-            if (
-                0
-                <= point_index
-                < len(dataframe)
-            ):
-                return dataframe.iloc[
-                    point_index
-                ]
+            if 0 <= point_index < len(dataframe):
+                return dataframe.iloc[point_index]
 
         except Exception:
             pass
@@ -3670,9 +3174,7 @@ def process_drawing_click(
     try:
         anchor_price = float(clicked_y)
     except Exception:
-        anchor_price = float(
-            row["close"]
-        )
+        anchor_price = float(row["close"])
 
     if mode == "Line at High":
         price = float(row["high"])
@@ -3680,17 +3182,13 @@ def process_drawing_click(
         add_horizontal_line(
             price,
             label=(
-                f"H "
-                f"{format_price(price, False)}"
+                f"H {format_price(price, False)}"
             ),
             color="#ef4444",
         )
 
         st.toast(
-            (
-                "Persistent high line added at "
-                f"{format_price(price)}"
-            ),
+            f"Persistent high line added at {format_price(price)}",
             icon="📌",
         )
 
@@ -3700,17 +3198,13 @@ def process_drawing_click(
         add_horizontal_line(
             price,
             label=(
-                f"C "
-                f"{format_price(price, False)}"
+                f"C {format_price(price, False)}"
             ),
             color="#22d3ee",
         )
 
         st.toast(
-            (
-                "Persistent close line added at "
-                f"{format_price(price)}"
-            ),
+            f"Persistent close line added at {format_price(price)}",
             icon="📌",
         )
 
@@ -3720,17 +3214,13 @@ def process_drawing_click(
         add_horizontal_line(
             price,
             label=(
-                f"L "
-                f"{format_price(price, False)}"
+                f"L {format_price(price, False)}"
             ),
             color="#22c55e",
         )
 
         st.toast(
-            (
-                "Persistent low line added at "
-                f"{format_price(price)}"
-            ),
+            f"Persistent low line added at {format_price(price)}",
             icon="📌",
         )
 
@@ -3742,29 +3232,15 @@ def process_drawing_click(
             }
         )
 
-        if len(
-            st.session_state.draw_clicks
-        ) == 1:
+        if len(st.session_state.draw_clicks) == 1:
             st.toast(
-                (
-                    "Band point one saved. "
-                    "Choose the second point."
-                ),
+                "Band point one saved. Choose the second point.",
                 icon="🖱️",
             )
 
-        elif len(
-            st.session_state.draw_clicks
-        ) >= 2:
-            first = (
-                st.session_state
-                .draw_clicks[0]
-            )
-
-            second = (
-                st.session_state
-                .draw_clicks[1]
-            )
+        elif len(st.session_state.draw_clicks) >= 2:
+            first = st.session_state.draw_clicks[0]
+            second = st.session_state.draw_clicks[1]
 
             add_band(
                 first["price"],
@@ -3786,29 +3262,15 @@ def process_drawing_click(
             }
         )
 
-        if len(
-            st.session_state.draw_clicks
-        ) == 1:
+        if len(st.session_state.draw_clicks) == 1:
             st.toast(
-                (
-                    "Trend point one saved. "
-                    "Choose the second point."
-                ),
+                "Trend point one saved. Choose the second point.",
                 icon="🖱️",
             )
 
-        elif len(
-            st.session_state.draw_clicks
-        ) >= 2:
-            first = (
-                st.session_state
-                .draw_clicks[0]
-            )
-
-            second = (
-                st.session_state
-                .draw_clicks[1]
-            )
+        elif len(st.session_state.draw_clicks) >= 2:
+            first = st.session_state.draw_clicks[0]
+            second = st.session_state.draw_clicks[1]
 
             add_trend_line(
                 first["timestamp"],
@@ -3871,10 +3333,8 @@ effective_session_mode = (
 )
 
 st.sidebar.info(
-    (
-        "Detected/applied session: "
-        f"**{effective_session_mode}**"
-    )
+    "Detected/applied session: "
+    f"**{effective_session_mode}**"
 )
 
 custom_start_time = time(9, 30)
@@ -3882,18 +3342,14 @@ custom_end_time = time(16, 0)
 custom_include_weekends = False
 
 if effective_session_mode == "Custom Session":
-    custom_start_time = (
-        st.sidebar.time_input(
-            "Custom session start",
-            value=time(9, 30),
-        )
+    custom_start_time = st.sidebar.time_input(
+        "Custom session start",
+        value=time(9, 30),
     )
 
-    custom_end_time = (
-        st.sidebar.time_input(
-            "Custom session end",
-            value=time(16, 0),
-        )
+    custom_end_time = st.sidebar.time_input(
+        "Custom session end",
+        value=time(16, 0),
     )
 
     custom_include_weekends = (
@@ -3904,10 +3360,8 @@ if effective_session_mode == "Custom Session":
     )
 
 st.sidebar.caption(
-    (
-        "Yahoo native interval: "
-        f"`{timeframe_configuration['yf_interval']}`"
-    )
+    "Yahoo native interval: "
+    f"`{timeframe_configuration['yf_interval']}`"
 )
 
 
@@ -3924,10 +3378,7 @@ selected_start_timestamp = None
 if ticker:
     with st.sidebar:
         with st.spinner(
-            (
-                f"Loading {timeframe} "
-                f"data for {ticker}..."
-            )
+            f"Loading {timeframe} data for {ticker}..."
         ):
             source_dataframe = fetch_history(
                 ticker,
@@ -3940,10 +3391,8 @@ st.sidebar.subheader(
 
 if source_dataframe.empty:
     st.sidebar.error(
-        (
-            "No Yahoo data was returned. "
-            "Check the ticker or timeframe."
-        )
+        "No Yahoo data was returned. "
+        "Check the ticker or timeframe."
     )
 
     st.sidebar.date_input(
@@ -3961,35 +3410,24 @@ if source_dataframe.empty:
     )
 
 else:
-    filtered_dataframe = (
-        apply_session_filter(
-            source_dataframe,
-            effective_session_mode,
-            intraday=timeframe_configuration[
-                "intraday"
-            ],
-        )
+    filtered_dataframe = apply_session_filter(
+        source_dataframe,
+        effective_session_mode,
+        intraday=timeframe_configuration["intraday"],
     )
 
-    if (
-        effective_session_mode
-        == "Custom Session"
-    ):
-        filtered_dataframe = (
-            apply_custom_session(
-                filtered_dataframe,
-                custom_start_time,
-                custom_end_time,
-                custom_include_weekends,
-            )
+    if effective_session_mode == "Custom Session":
+        filtered_dataframe = apply_custom_session(
+            filtered_dataframe,
+            custom_start_time,
+            custom_end_time,
+            custom_include_weekends,
         )
 
     if filtered_dataframe.empty:
         st.sidebar.error(
-            (
-                "Yahoo returned data, but no bars "
-                "matched the selected session."
-            )
+            "Yahoo returned data, but no bars "
+            "matched the selected session."
         )
 
         st.sidebar.date_input(
@@ -4011,11 +3449,8 @@ else:
             {
                 to_pydate(session_date)
                 for session_date
-                in filtered_dataframe[
-                    "session_date"
-                ].unique()
-                if to_pydate(session_date)
-                is not None
+                in filtered_dataframe["session_date"].unique()
+                if to_pydate(session_date) is not None
             }
         )
 
@@ -4023,20 +3458,13 @@ else:
         last_date = available_dates[-1]
 
         if len(available_dates) >= 3:
-            default_practice_date = (
-                available_dates[-3]
-            )
+            default_practice_date = available_dates[-3]
         else:
-            default_practice_date = (
-                available_dates[-1]
-            )
+            default_practice_date = available_dates[-1]
 
         st.sidebar.success(
-            (
-                f"{len(filtered_dataframe):,} "
-                f"session bars\n"
-                f"{first_date} → {last_date}"
-            )
+            f"{len(filtered_dataframe):,} session bars\n"
+            f"{first_date} → {last_date}"
         )
 
         practice_date_key = (
@@ -4046,13 +3474,9 @@ else:
         )
 
         saved_practice_date = to_pydate(
-            st.session_state.get(
-                practice_date_key
-            )
+            st.session_state.get(practice_date_key)
         )
 
-        # Only reset if missing or outside the downloaded range.
-        # Invalid weekends remain selected and show a warning.
         if (
             saved_practice_date is None
             or saved_practice_date < first_date
@@ -4073,9 +3497,8 @@ else:
 
         practice_rows = (
             filtered_dataframe[
-                filtered_dataframe[
-                    "session_date"
-                ].map(to_pydate)
+                filtered_dataframe["session_date"]
+                .map(to_pydate)
                 == practice_date
             ]
             .copy()
@@ -4083,12 +3506,9 @@ else:
 
         if practice_rows.empty:
             st.sidebar.warning(
-                (
-                    "No trading session exists for "
-                    "this date. For CME futures, "
-                    "Sunday evening belongs to the "
-                    "Monday trading session."
-                )
+                "No trading session exists for this date. "
+                "For CME futures, Sunday evening belongs "
+                "to the Monday trading session."
             )
 
             st.sidebar.selectbox(
@@ -4096,33 +3516,24 @@ else:
                 ["--"],
                 disabled=True,
                 key=(
-                    f"empty_start_"
-                    f"{ticker}_"
-                    f"{timeframe}_"
-                    f"{practice_date}"
+                    f"empty_start_{ticker}_"
+                    f"{timeframe}_{practice_date}"
                 ),
             )
 
-        elif timeframe_configuration[
-            "intraday"
-        ]:
+        elif timeframe_configuration["intraday"]:
             practice_rows["start_label"] = (
                 practice_rows["timestamp"]
-                .dt.strftime(
-                    "%Y-%m-%d %H:%M"
-                )
+                .dt.strftime("%Y-%m-%d %H:%M")
             )
 
             start_labels = (
-                practice_rows[
-                    "start_label"
-                ].tolist()
+                practice_rows["start_label"].tolist()
             )
 
             start_time_key = (
                 f"start_time_{ticker}_"
-                f"{timeframe}_"
-                f"{practice_date}"
+                f"{timeframe}_{practice_date}"
             )
 
             selected_start_label = (
@@ -4139,9 +3550,7 @@ else:
 
             selected_start_timestamp = (
                 practice_rows[
-                    practice_rows[
-                        "start_label"
-                    ]
+                    practice_rows["start_label"]
                     == selected_start_label
                 ]["timestamp"]
                 .iloc[0]
@@ -4151,16 +3560,12 @@ else:
 
         else:
             selected_start_timestamp = (
-                practice_rows[
-                    "timestamp"
-                ].iloc[0]
+                practice_rows["timestamp"].iloc[0]
             )
 
             st.sidebar.caption(
-                (
-                    "Daily timeframe: replay "
-                    "starts at the selected session."
-                )
+                "Daily timeframe: replay starts "
+                "at the selected session."
             )
 
             can_start = True
@@ -4180,10 +3585,8 @@ carry_positions = st.sidebar.checkbox(
 )
 
 st.sidebar.caption(
-    (
-        "When off, an open position is closed "
-        "at the last bar of the trading session."
-    )
+    "When off, an open position is closed "
+    "at the last bar of the trading session."
 )
 
 
@@ -4266,11 +3669,11 @@ show_structure_labels = (
 
 show_local_sr_zones = (
     st.sidebar.checkbox(
-        "Show local 5m S/R zones",
+        "Show local chart S/R zones",
         value=False,
         help=(
-            "Uses recent chart swings. This is "
-            "more sensitive and may include noise."
+            "Uses recent chart swings. "
+            "This is more sensitive and may include noise."
         ),
     )
 )
@@ -4281,9 +3684,7 @@ show_five_session_sr = (
         value=True,
         help=(
             "Uses highs and lows from the five "
-            "completed sessions before the "
-            "current session. Nearby prices are "
-            "merged to remove noise."
+            "completed sessions before the current session."
         ),
     )
 )
@@ -4301,21 +3702,12 @@ show_developing_session_hl = (
     st.sidebar.checkbox(
         "Show developing current-session H/L",
         value=True,
-        help=(
-            "The current session is not included "
-            "in the fixed five-session levels. "
-            "Its high and low update separately."
-        ),
     )
 )
 
 st.sidebar.caption(
-    (
-        "Automatic S/R uses five completed "
-        "trading sessions. The levels remain "
-        "stable during the current session. "
-        "The developing high/low can move."
-    )
+    "S/R text is displayed in the right-side "
+    "label rail so it does not cover candles."
 )
 
 
@@ -4339,25 +3731,19 @@ follow_replay = st.sidebar.checkbox(
 )
 
 follow_bars = st.sidebar.radio(
-    (
-        "Follow window "
-        "(futures/forex/crypto)"
-    ),
+    "Follow window (futures/forex/crypto)",
     FOLLOW_WINDOW_OPTIONS,
     index=1,
     horizontal=True,
 )
 
 st.sidebar.caption(
-    (
-        "Continuous markets: Follow displays "
-        "the most recent 100 or 200 trading "
-        "bars. Maintenance breaks and weekends "
-        "do not consume chart space.\n\n"
-        "Stocks: Follow displays the current "
-        "regular trading session.\n\n"
-        "Follow OFF uses the selected context."
-    )
+    "Continuous markets: Follow displays the "
+    "most recent 100 or 200 trading bars. "
+    "Maintenance breaks and weekends do not "
+    "consume chart space.\n\n"
+    "Stocks: Follow displays the current session.\n\n"
+    "Follow OFF uses the selected context."
 )
 
 
@@ -4373,18 +3759,9 @@ draw_mode = st.sidebar.selectbox(
     index=0,
 )
 
-if (
-    draw_mode
-    != st.session_state.last_draw_mode
-):
-    st.session_state.last_draw_mode = (
-        draw_mode
-    )
-
-    st.session_state.last_draw_signature = (
-        None
-    )
-
+if draw_mode != st.session_state.last_draw_mode:
+    st.session_state.last_draw_mode = draw_mode
+    st.session_state.last_draw_signature = None
     st.session_state.draw_clicks = []
 
 drawing_ticker = (
@@ -4417,15 +3794,10 @@ if st.sidebar.button(
     )
 
     st.session_state.draw_clicks = []
-    st.session_state.last_draw_signature = (
-        None
-    )
+    st.session_state.last_draw_signature = None
 
     st.toast(
-        (
-            f"Cleared saved drawings for "
-            f"{drawing_ticker}."
-        ),
+        f"Cleared saved drawings for {drawing_ticker}.",
         icon="🧹",
     )
 
@@ -4433,18 +3805,13 @@ if st.sidebar.button(
 
 if st.session_state.draw_clicks:
     st.sidebar.info(
-        (
-            "Pending drawing points: "
-            f"{len(st.session_state.draw_clicks)} / 2"
-        )
+        "Pending drawing points: "
+        f"{len(st.session_state.draw_clicks)} / 2"
     )
 
 st.sidebar.caption(
-    (
-        "Manual drawings are saved in SQLite "
-        "by ticker. They survive replay resets "
-        "and app restarts."
-    )
+    "Manual drawings are saved in SQLite "
+    "by ticker and survive replay resets."
 )
 
 
@@ -4474,47 +3841,27 @@ if st.sidebar.button(
 
     if not matching_indices:
         st.sidebar.error(
-            (
-                "Could not find the selected "
-                "replay start bar."
-            )
+            "Could not find the selected replay start bar."
         )
 
     else:
-        st.session_state.df = (
-            active_dataframe
-        )
-
-        st.session_state.step = (
-            matching_indices[0]
-        )
-
-        st.session_state.active_ticker = (
-            ticker
-        )
-
-        st.session_state.active_interval = (
-            timeframe
-        )
-
+        st.session_state.df = active_dataframe
+        st.session_state.step = matching_indices[0]
+        st.session_state.active_ticker = ticker
+        st.session_state.active_interval = timeframe
         st.session_state.active_session_mode = (
             effective_session_mode
         )
-
         st.session_state.active_practice_date = (
             practice_date
         )
-
         st.session_state.active_carry_mode = (
             carry_positions
         )
 
-        # Drawings are intentionally NOT cleared.
+        # Persistent drawings are intentionally not cleared.
         st.session_state.draw_clicks = []
-        st.session_state.last_draw_signature = (
-            None
-        )
-
+        st.session_state.last_draw_signature = None
         st.session_state.camera_revision += 1
         st.session_state.camera_signature = None
         st.session_state.force_camera = True
@@ -4529,12 +3876,9 @@ if st.sidebar.button(
 st.title("💹 Market Replay Simulator")
 
 st.caption(
-    (
-        "Session-compressed replay • "
-        "5-session automatic S/R • "
-        "persistent drawings • "
-        "persistent paper account"
-    )
+    "Session-compressed replay • automatic 5-session S/R • "
+    "right-side S/R label rail • persistent drawings • "
+    "persistent paper account"
 )
 
 if (
@@ -4542,30 +3886,22 @@ if (
     or st.session_state.df.empty
 ):
     st.info(
-        (
-            "Choose a ticker, timeframe, "
-            "practice date, and start time. "
-            "Then click Start / Reset Replay."
-        )
+        "Choose a ticker, timeframe, practice date, "
+        "and start time. Then click Start / Reset Replay."
     )
 
     st.stop()
 
 
-# Warn if setup differs from active replay.
 if (
     st.session_state.active_ticker != ticker
-    or st.session_state.active_interval
-    != timeframe
+    or st.session_state.active_interval != timeframe
     or st.session_state.active_session_mode
     != effective_session_mode
 ):
     st.warning(
-        (
-            "Sidebar setup differs from the "
-            "active replay. Click Start / Reset "
-            "Replay to apply the new setup."
-        )
+        "Sidebar setup differs from the active replay. "
+        "Click Start / Reset Replay to apply it."
     )
 
 
@@ -4647,9 +3983,7 @@ if show_moving_averages:
 if show_volume_ma:
     calculated_dataframe["volume_ma"] = (
         calculated_dataframe["volume"]
-        .rolling(
-            int(volume_ma_length)
-        )
+        .rolling(int(volume_ma_length))
         .mean()
     )
 
@@ -4686,13 +4020,9 @@ current_chart_matches = (
 )
 
 if current_chart_matches:
-    current_x_index = (
-        current_chart_matches[-1]
-    )
+    current_x_index = current_chart_matches[-1]
 else:
-    current_x_index = (
-        len(chart_dataframe) - 1
-    )
+    current_x_index = len(chart_dataframe) - 1
 
 
 # ============================================================
@@ -4701,9 +4031,7 @@ else:
 if follow_replay and continuous_market:
     start_index = max(
         0,
-        current_x_index
-        - int(follow_bars)
-        + 1,
+        current_x_index - int(follow_bars) + 1,
     )
 
     end_index = current_x_index
@@ -4724,35 +4052,24 @@ elif follow_replay:
     if current_session_rows.empty:
         start_index = 0
         end_index = current_x_index
-
     else:
         start_index = int(
-            current_session_rows[
-                "x_index"
-            ].iloc[0]
+            current_session_rows["x_index"].iloc[0]
         )
 
         end_index = current_x_index
 
-    follow_title = (
-        "Follow: current session"
-    )
+    follow_title = "Follow: current session"
 
 else:
     start_index = 0
-    end_index = (
-        len(chart_dataframe) - 1
-    )
-
+    end_index = len(chart_dataframe) - 1
     follow_title = "Follow: OFF"
 
 
 visible_dataframe = (
     chart_dataframe
-    .iloc[
-        start_index:
-        end_index + 1
-    ]
+    .iloc[start_index:end_index + 1]
     .copy()
 )
 
@@ -4766,7 +4083,43 @@ volume_axis_range = get_volume_axis_range(
 
 
 # ============================================================
-# AUTOMATIC S/R CALCULATION
+# RIGHT-SIDE LABEL RAIL
+# ============================================================
+visible_bar_count = max(
+    1,
+    end_index - start_index + 1,
+)
+
+label_rail_width = int(
+    round(
+        visible_bar_count
+        * LABEL_RAIL_PERCENT
+    )
+)
+
+label_rail_width = max(
+    MIN_LABEL_RAIL_BARS,
+    min(
+        MAX_LABEL_RAIL_BARS,
+        label_rail_width,
+    ),
+)
+
+label_rail_start_x = (
+    end_index + 0.75
+)
+
+label_rail_label_x = (
+    end_index + 2.0
+)
+
+label_rail_end_x = (
+    end_index + label_rail_width
+)
+
+
+# ============================================================
+# AUTOMATIC S/R
 # ============================================================
 automatic_sr_levels = []
 automatic_sr_sessions = []
@@ -4805,8 +4158,7 @@ position = load_position()
 
 position_is_on_active_ticker = (
     position is not None
-    and position["ticker"]
-    == active_ticker
+    and position["ticker"] == active_ticker
 )
 
 if position_is_on_active_ticker:
@@ -4908,8 +4260,7 @@ position_caption = (
 
 if position is not None:
     position_caption += (
-        f" • Position ticker: "
-        f"{position['ticker']}"
+        f" • Position ticker: {position['ticker']}"
     )
 
 st.caption(position_caption)
@@ -4919,13 +4270,9 @@ if (
     and not position_is_on_active_ticker
 ):
     st.warning(
-        (
-            f"Your open position is on "
-            f"`{position['ticker']}`. "
-            f"The current chart is `{active_ticker}`. "
-            "Switch to the position ticker to update "
-            "its mark, stop, target, or close it."
-        )
+        f"Your open position is on `{position['ticker']}`. "
+        f"The current chart is `{active_ticker}`. "
+        "Switch to the position ticker to manage it."
     )
 
 
@@ -4983,12 +4330,8 @@ figure.add_trace(
         },
         customdata=np.column_stack(
             [
-                chart_dataframe[
-                    "timestamp"
-                ].astype(str),
-                chart_dataframe[
-                    "session_date"
-                ].astype(str),
+                chart_dataframe["timestamp"].astype(str),
+                chart_dataframe["session_date"].astype(str),
             ]
         ),
         hovertemplate=candlestick_hover,
@@ -5018,17 +4361,12 @@ figure.add_trace(
 
 if (
     show_moving_averages
-    and "fast_ma"
-    in chart_dataframe.columns
+    and "fast_ma" in chart_dataframe.columns
 ):
     figure.add_trace(
         go.Scatter(
-            x=chart_dataframe[
-                "x_index"
-            ],
-            y=chart_dataframe[
-                "fast_ma"
-            ],
+            x=chart_dataframe["x_index"],
+            y=chart_dataframe["fast_ma"],
             name=(
                 f"{moving_average_type}"
                 f"{int(fast_length)}"
@@ -5044,12 +4382,8 @@ if (
 
     figure.add_trace(
         go.Scatter(
-            x=chart_dataframe[
-                "x_index"
-            ],
-            y=chart_dataframe[
-                "slow_ma"
-            ],
+            x=chart_dataframe["x_index"],
+            y=chart_dataframe["slow_ma"],
             name=(
                 f"{moving_average_type}"
                 f"{int(slow_length)}"
@@ -5065,20 +4399,14 @@ if (
 
 if (
     show_volume_ma
-    and "volume_ma"
-    in chart_dataframe.columns
+    and "volume_ma" in chart_dataframe.columns
 ):
     figure.add_trace(
         go.Scatter(
-            x=chart_dataframe[
-                "x_index"
-            ],
-            y=chart_dataframe[
-                "volume_ma"
-            ],
+            x=chart_dataframe["x_index"],
+            y=chart_dataframe["volume_ma"],
             name=(
-                f"VolMA "
-                f"{int(volume_ma_length)}"
+                f"VolMA {int(volume_ma_length)}"
             ),
             line={
                 "color": C_VOL_MA,
@@ -5091,26 +4419,43 @@ if (
 
 
 # ============================================================
+# RIGHT-SIDE LABEL RAIL BACKGROUND
+# ============================================================
+figure.add_vrect(
+    x0=label_rail_start_x,
+    x1=label_rail_end_x,
+    row=1,
+    col=1,
+    fillcolor="rgba(15,23,42,0.68)",
+    line_width=0,
+    layer="below",
+)
+
+figure.add_vline(
+    x=label_rail_start_x,
+    row=1,
+    col=1,
+    line_color="#64748b",
+    line_width=1,
+    line_dash="dot",
+)
+
+
+# ============================================================
 # CLICK TARGET FOR DRAWING MODE
 # ============================================================
 if draw_mode != "None":
     figure.add_trace(
         go.Scatter(
-            x=chart_dataframe[
-                "x_index"
-            ],
-            y=chart_dataframe[
-                "close"
-            ],
+            x=chart_dataframe["x_index"],
+            y=chart_dataframe["close"],
             mode="markers",
             name="Drawing click targets",
             showlegend=False,
             hoverinfo="skip",
             marker={
                 "size": 14,
-                "color": (
-                    "rgba(255,255,255,0.01)"
-                ),
+                "color": "rgba(255,255,255,0.01)",
                 "line": {
                     "width": 0
                 },
@@ -5320,15 +4665,10 @@ if (
     local_zones = sorted(
         local_zones,
         key=lambda zone: (
-            abs(
-                zone["mid"]
-                - current_price
-            ),
+            abs(zone["mid"] - current_price),
             -zone["touches"],
         ),
     )[:MAX_LOCAL_ZONES_DRAWN]
-
-    local_label_x = current_x_index
 
     for zone in local_zones:
         role = local_zone_role(
@@ -5368,34 +4708,22 @@ if (
             line_dash="dot",
         )
 
-        figure.add_annotation(
-            x=local_label_x,
-            y=zone["mid"],
-            row=1,
-            col=1,
-            xanchor="left",
-            text=(
-                f"<b>{tag} "
+        add_rail_label(
+            figure,
+            label_rail_label_x,
+            zone["mid"],
+            (
+                f"{tag} "
                 f"{format_price(zone['mid'], False)} "
-                f"({zone['touches']}x)</b>"
+                f"({zone['touches']}x)"
             ),
-            showarrow=False,
-            font={
-                "size": 9,
-                "color": "#ffffff",
-            },
-            bgcolor=color,
-            bordercolor="#e5e7eb",
-            borderwidth=1,
-            borderpad=3,
+            color,
         )
 
 
 # ============================================================
-# AUTOMATIC 5-SESSION S/R LINES
+# AUTOMATIC 5-SESSION S/R
 # ============================================================
-automatic_label_x = current_x_index
-
 for level in automatic_sr_levels:
     level_price = float(
         level["price"]
@@ -5431,28 +4759,17 @@ for level in automatic_sr_levels:
         line_dash="dash",
     )
 
-    figure.add_annotation(
-        x=automatic_label_x,
-        y=level_price,
-        row=1,
-        col=1,
-        xanchor="left",
-        text=(
-            f"<b>5S {level_role} "
+    add_rail_label(
+        figure,
+        label_rail_label_x,
+        level_price,
+        (
+            f"5S {level_role} "
             f"{format_price(level_price, False)} "
             f"• {level['touches']} touch"
-            f"{'es' if level['touches'] != 1 else ''}</b>"
+            f"{'es' if level['touches'] != 1 else ''}"
         ),
-        showarrow=False,
-        font={
-            "size": 9,
-            "color": "#ffffff",
-        },
-        bgcolor=level_color,
-        bordercolor="#e5e7eb",
-        borderwidth=1,
-        borderpad=3,
-        opacity=0.92,
+        level_color,
     )
 
 
@@ -5477,23 +4794,16 @@ if developing_session_levels is not None:
         line_dash="dot",
     )
 
-    figure.add_annotation(
-        x=current_x_index,
-        y=developing_high,
-        row=1,
-        col=1,
-        xanchor="left",
-        text=(
-            f"<b>SESSION H "
-            f"{format_price(developing_high, False)}</b>"
+    add_rail_label(
+        figure,
+        label_rail_label_x,
+        developing_high,
+        (
+            f"SESSION H "
+            f"{format_price(developing_high, False)}"
         ),
-        showarrow=False,
-        font={
-            "size": 9,
-            "color": "#111111",
-        },
-        bgcolor=C_DEVELOPING_HIGH,
-        borderpad=3,
+        C_DEVELOPING_HIGH,
+        foreground_color="#111111",
     )
 
     if abs(
@@ -5508,23 +4818,16 @@ if developing_session_levels is not None:
             line_dash="dot",
         )
 
-        figure.add_annotation(
-            x=current_x_index,
-            y=developing_low,
-            row=1,
-            col=1,
-            xanchor="left",
-            text=(
-                f"<b>SESSION L "
-                f"{format_price(developing_low, False)}</b>"
+        add_rail_label(
+            figure,
+            label_rail_label_x,
+            developing_low,
+            (
+                f"SESSION L "
+                f"{format_price(developing_low, False)}"
             ),
-            showarrow=False,
-            font={
-                "size": 9,
-                "color": "#111111",
-            },
-            bgcolor=C_DEVELOPING_LOW,
-            borderpad=3,
+            C_DEVELOPING_LOW,
+            foreground_color="#111111",
         )
 
 
@@ -5534,9 +4837,7 @@ if developing_session_levels is not None:
 if position_is_on_active_ticker:
     if position["stop_loss"] is not None:
         figure.add_hline(
-            y=float(
-                position["stop_loss"]
-            ),
+            y=float(position["stop_loss"]),
             row=1,
             col=1,
             line_color="#fb923c",
@@ -5616,7 +4917,11 @@ for marker in st.session_state.markers:
 
     figure.add_trace(
         go.Scatter(
-            x=[marker_matches[-1]],
+            x=[
+                chart_dataframe[
+                    "x_index"
+                ].iloc[marker_matches[-1]]
+            ],
             y=[marker["price"]],
             mode="markers",
             showlegend=False,
@@ -5646,37 +4951,35 @@ persistent_drawings = (
 
 for drawing in persistent_drawings:
     if drawing["type"] == "hline":
+        drawing_price = float(
+            drawing["price"]
+        )
+
+        drawing_color = drawing.get(
+            "color",
+            C_MANUAL_SR,
+        )
+
         figure.add_hline(
-            y=float(drawing["price"]),
+            y=drawing_price,
             row=1,
             col=1,
-            line_color=drawing.get(
-                "color",
-                "#22d3ee",
-            ),
+            line_color=drawing_color,
             line_width=1.8,
         )
 
-        figure.add_annotation(
-            x=current_x_index,
-            y=float(drawing["price"]),
-            row=1,
-            col=1,
-            xanchor="left",
-            text=drawing.get(
+        add_rail_label(
+            figure,
+            label_rail_label_x,
+            drawing_price,
+            drawing.get(
                 "label",
-                "",
-            ),
-            showarrow=False,
-            font={
-                "size": 10,
-                "color": drawing.get(
-                    "color",
-                    "#22d3ee",
+                (
+                    f"S/R "
+                    f"{format_price(drawing_price, False)}"
                 ),
-            },
-            bgcolor="rgba(0,0,0,0.65)",
-            borderpad=2,
+            ),
+            drawing_color,
         )
 
     elif drawing["type"] == "band":
@@ -5723,11 +5026,19 @@ for drawing in persistent_drawings:
         )
 
         if first_matches and second_matches:
+            first_x = chart_dataframe[
+                "x_index"
+            ].iloc[first_matches[-1]]
+
+            second_x = chart_dataframe[
+                "x_index"
+            ].iloc[second_matches[-1]]
+
             figure.add_trace(
                 go.Scatter(
                     x=[
-                        first_matches[-1],
-                        second_matches[-1],
+                        first_x,
+                        second_x,
                     ],
                     y=[
                         float(drawing["y0"]),
@@ -5751,14 +5062,9 @@ for drawing in persistent_drawings:
 # ============================================================
 # TICKS / CAMERA
 # ============================================================
-visible_count = max(
-    1,
-    end_index - start_index + 1,
-)
-
 number_of_ticks = min(
     12,
-    visible_count,
+    visible_bar_count,
 )
 
 tick_values = np.unique(
@@ -5839,11 +5145,19 @@ figure.update_layout(
     ),
     margin={
         "l": 10,
-        "r": 210,
-        "t": 42,
+        "r": 25,
+        "t": 75,
         "b": 10,
     },
     showlegend=True,
+    legend={
+        "orientation": "h",
+        "yanchor": "bottom",
+        "y": 1.02,
+        "xanchor": "left",
+        "x": 0,
+        "bgcolor": "rgba(0,0,0,0.45)",
+    },
     hovermode="x",
     uirevision=ui_revision,
     xaxis_rangeslider_visible=False,
@@ -5887,13 +5201,9 @@ figure.update_yaxes(
 )
 
 if apply_camera:
-    right_padding = 6
-
     x_axis_range = [
         start_index - 0.5,
-        end_index
-        + right_padding
-        + 0.5,
+        label_rail_end_x + 0.5,
     ]
 
     figure.update_xaxes(
@@ -5925,9 +5235,7 @@ if apply_camera:
         )
 
     if not follow_replay:
-        st.session_state.force_camera = (
-            False
-        )
+        st.session_state.force_camera = False
 
 else:
     figure.update_yaxes(
@@ -5968,13 +5276,9 @@ with chart_column:
 
     else:
         st.info(
-            (
-                "Drawing mode is active. Click or "
-                "drag-select a candle. If your "
-                "browser does not return a chart "
-                "selection, use Manual drawing "
-                "helpers below."
-            )
+            "Drawing mode is active. Click or drag-select "
+            "a candle. If chart selection is unreliable, "
+            "use Manual drawing helpers below."
         )
 
         try:
@@ -6008,9 +5312,7 @@ with chart_column:
         )
 
         if selected_points:
-            selected_point = (
-                selected_points[-1]
-            )
+            selected_point = selected_points[-1]
 
             selected_row = (
                 nearest_row_from_event(
@@ -6019,20 +5321,13 @@ with chart_column:
                 )
             )
 
-            clicked_y = (
-                selected_point.get("y")
-            )
+            clicked_y = selected_point.get("y")
 
             signature = (
                 draw_mode,
                 (
-                    str(
-                        selected_row[
-                            "timestamp"
-                        ]
-                    )
-                    if selected_row
-                    is not None
+                    str(selected_row["timestamp"])
+                    if selected_row is not None
                     else ""
                 ),
                 str(clicked_y),
@@ -6040,13 +5335,11 @@ with chart_column:
 
             if (
                 signature
-                != st.session_state[
-                    "last_draw_signature"
-                ]
+                != st.session_state.last_draw_signature
             ):
-                st.session_state[
-                    "last_draw_signature"
-                ] = signature
+                st.session_state.last_draw_signature = (
+                    signature
+                )
 
                 process_drawing_click(
                     draw_mode,
@@ -6061,9 +5354,7 @@ with control_column:
     st.markdown("#### ⏱️")
 
     st.caption(
-        current_timestamp.strftime(
-            "%H:%M"
-        )
+        current_timestamp.strftime("%H:%M")
     )
 
     st.caption(
@@ -6145,44 +5436,29 @@ with control_column:
     )
 
     st.caption(
-        (
-            f"Visible bars: "
-            f"{len(visible_dataframe):,}"
-        )
+        f"Visible bars: {len(visible_dataframe):,}"
     )
 
     st.caption(
-        (
-            f"Rendered bars: "
-            f"{len(chart_dataframe):,}"
-        )
+        f"Rendered bars: {len(chart_dataframe):,}"
     )
 
     if continuous_market:
         st.caption(
-            (
-                f"Follow window: "
-                f"{int(follow_bars)} bars"
-            )
+            f"Follow window: {int(follow_bars)} bars"
         )
-
     else:
         st.caption(
             "Follow window: session"
         )
 
     st.caption(
-        (
-            "Carry: "
-            f"{'ON' if st.session_state.active_carry_mode else 'OFF'}"
-        )
+        "Carry: "
+        f"{'ON' if st.session_state.active_carry_mode else 'OFF'}"
     )
 
     st.caption(
-        (
-            f"5S S/R levels: "
-            f"{len(automatic_sr_levels)}"
-        )
+        f"5S S/R levels: {len(automatic_sr_levels)}"
     )
 
 
@@ -6194,11 +5470,8 @@ with st.expander(
     expanded=False,
 ):
     st.caption(
-        (
-            "Manual drawings are stored in "
-            "SQLite by ticker and remain after "
-            "Start / Reset Replay and app restarts."
-        )
+        "Manual drawings are stored in SQLite by ticker. "
+        "Horizontal-line labels appear in the right-side rail."
     )
 
     if chart_dataframe.empty:
@@ -6213,9 +5486,7 @@ with st.expander(
 
         helper_dataframe["choice"] = (
             helper_dataframe["timestamp"]
-            .dt.strftime(
-                "%Y-%m-%d %H:%M"
-            )
+            .dt.strftime("%Y-%m-%d %H:%M")
         )
 
         helper_choices = (
@@ -6228,8 +5499,7 @@ with st.expander(
                 "Select candle",
                 helper_choices,
                 key=(
-                    f"manual_candle_"
-                    f"{active_ticker}"
+                    f"manual_candle_{active_ticker}"
                 ),
             )
         )
@@ -6242,12 +5512,16 @@ with st.expander(
             .iloc[0]
         )
 
+        selected_timestamp_key = int(
+            pd.Timestamp(
+                selected_helper_row["timestamp"]
+            ).value
+        )
+
         manual_price = st.number_input(
             "S/R price or drawing point",
             value=float(
-                selected_helper_row[
-                    "close"
-                ]
+                selected_helper_row["close"]
             ),
             step=price_input_step(
                 current_price
@@ -6257,7 +5531,8 @@ with st.expander(
             ),
             key=(
                 f"manual_sr_price_"
-                f"{active_ticker}"
+                f"{active_ticker}_"
+                f"{selected_timestamp_key}"
             ),
         )
 
@@ -6271,9 +5546,7 @@ with st.expander(
                 width="stretch",
             ):
                 high_price = float(
-                    selected_helper_row[
-                        "high"
-                    ]
+                    selected_helper_row["high"]
                 )
 
                 add_horizontal_line(
@@ -6293,9 +5566,7 @@ with st.expander(
                 width="stretch",
             ):
                 close_price = float(
-                    selected_helper_row[
-                        "close"
-                    ]
+                    selected_helper_row["close"]
                 )
 
                 add_horizontal_line(
@@ -6315,9 +5586,7 @@ with st.expander(
                 width="stretch",
             ):
                 low_price = float(
-                    selected_helper_row[
-                        "low"
-                    ]
+                    selected_helper_row["low"]
                 )
 
                 add_horizontal_line(
@@ -6342,7 +5611,7 @@ with st.expander(
                         f"S/R "
                         f"{format_price(manual_price, False)}"
                     ),
-                    "#eab308",
+                    C_MANUAL_SR,
                 )
 
                 st.rerun()
@@ -6374,20 +5643,14 @@ with st.expander(
                 width="stretch",
             ):
                 st.session_state.draw_clicks = []
-                st.session_state.last_draw_signature = (
-                    None
-                )
-
+                st.session_state.last_draw_signature = None
                 st.rerun()
 
         st.caption(
-            (
-                f"Saved drawings for "
-                f"{active_ticker}: "
-                f"{len(persistent_drawings)} • "
-                f"Pending points: "
-                f"{len(st.session_state.draw_clicks)}"
-            )
+            f"Saved drawings for {active_ticker}: "
+            f"{len(persistent_drawings)} • "
+            f"Pending points: "
+            f"{len(st.session_state.draw_clicks)}"
         )
 
 
@@ -6395,10 +5658,10 @@ with st.expander(
 # TRADE ENTRY / MANAGEMENT
 # ============================================================
 position = load_position()
+
 position_is_on_active_ticker = (
     position is not None
-    and position["ticker"]
-    == active_ticker
+    and position["ticker"] == active_ticker
 )
 
 price_step = price_input_step(
@@ -6425,11 +5688,8 @@ if position is None:
 
     if maximum_trade_amount <= 0:
         st.error(
-            (
-                "No cash is available. The "
-                "account will reset after true "
-                "equity depletion."
-            )
+            "No cash is available. The account will "
+            "reset after true equity depletion."
         )
 
     else:
@@ -6491,22 +5751,15 @@ if position is None:
             ):
                 if stop_input >= current_price:
                     st.error(
-                        (
-                            "Long stop must be "
-                            "below current price."
-                        )
+                        "Long stop must be below current price."
                     )
 
                 elif (
                     target_input != 0
-                    and target_input
-                    <= current_price
+                    and target_input <= current_price
                 ):
                     st.error(
-                        (
-                            "Long target must be "
-                            "above current price."
-                        )
+                        "Long target must be above current price."
                     )
 
                 else:
@@ -6543,22 +5796,15 @@ if position is None:
             ):
                 if stop_input <= current_price:
                     st.error(
-                        (
-                            "Short stop must be "
-                            "above current price."
-                        )
+                        "Short stop must be above current price."
                     )
 
                 elif (
                     target_input != 0
-                    and target_input
-                    >= current_price
+                    and target_input >= current_price
                 ):
                     st.error(
-                        (
-                            "Short target must be "
-                            "below current price."
-                        )
+                        "Short target must be below current price."
                     )
 
                 else:
@@ -6590,23 +5836,17 @@ elif not position_is_on_active_ticker:
     st.markdown("### 🎮 Open Position")
 
     st.warning(
-        (
-            f"The account currently has a "
-            f"{position['side'].upper()} position "
-            f"on `{position['ticker']}`. Switch "
-            "to that ticker to manage it. A second "
-            "position cannot be opened while it "
-            "remains active."
-        )
+        f"The account currently has a "
+        f"{position['side'].upper()} position on "
+        f"`{position['ticker']}`. Switch to that "
+        "ticker to manage it."
     )
 
 
 else:
     st.markdown(
-        (
-            "### 🎮 Manage "
-            f"{position['side'].upper()} Position"
-        )
+        "### 🎮 Manage "
+        f"{position['side'].upper()} Position"
     )
 
     manage_1, manage_2, manage_3, manage_4, manage_5 = (
@@ -6620,15 +5860,13 @@ else:
             "Modify Stop-Loss",
             value=float(
                 position["stop_loss"]
-                if position["stop_loss"]
-                is not None
+                if position["stop_loss"] is not None
                 else current_price
             ),
             step=price_step,
             format=price_format,
             key=(
-                f"modify_stop_"
-                f"{active_ticker}"
+                f"modify_stop_{active_ticker}"
             ),
         )
 
@@ -6637,15 +5875,13 @@ else:
             "Modify Target (0 = none)",
             value=float(
                 position["target"]
-                if position["target"]
-                is not None
+                if position["target"] is not None
                 else 0.0
             ),
             step=price_step,
             format=price_format,
             key=(
-                f"modify_target_"
-                f"{active_ticker}"
+                f"modify_target_{active_ticker}"
             ),
         )
 
@@ -6674,30 +5910,20 @@ else:
 
             if (
                 position["side"] == "long"
-                and modified_stop
-                >= current_price
+                and modified_stop >= current_price
             ):
                 st.error(
-                    (
-                        "Long stop must be "
-                        "below current price."
-                    )
+                    "Long stop must be below current price."
                 )
-
                 valid_update = False
 
             if (
                 position["side"] == "short"
-                and modified_stop
-                <= current_price
+                and modified_stop <= current_price
             ):
                 st.error(
-                    (
-                        "Short stop must be "
-                        "above current price."
-                    )
+                    "Short stop must be above current price."
                 )
-
                 valid_update = False
 
             if valid_update:
@@ -6711,13 +5937,13 @@ else:
                     else None
                 )
 
-                position[
-                    "last_mark_price"
-                ] = current_price
+                position["last_mark_price"] = (
+                    current_price
+                )
 
-                position[
-                    "last_mark_time"
-                ] = str(current_timestamp)
+                position["last_mark_time"] = str(
+                    current_timestamp
+                )
 
                 save_position(position)
                 st.rerun()
@@ -6767,39 +5993,27 @@ with st.expander(
 ):
     if not show_five_session_sr:
         st.info(
-            (
-                "Automatic five-session S/R "
-                "is currently disabled."
-            )
+            "Automatic five-session S/R is disabled."
         )
 
     elif not automatic_sr_levels:
         st.info(
-            (
-                "Not enough completed session "
-                "history is available yet."
-            )
+            "Not enough completed-session history is available."
         )
 
     else:
         sessions_text = ", ".join(
             str(session_date)
-            for session_date
-            in automatic_sr_sessions
+            for session_date in automatic_sr_sessions
         )
 
         st.caption(
-            (
-                "Completed sessions used: "
-                f"{sessions_text}"
-            )
+            f"Completed sessions used: {sessions_text}"
         )
 
         st.caption(
-            (
-                "Automatic merge tolerance: "
-                f"{format_price(automatic_sr_tolerance)}"
-            )
+            "Automatic merge tolerance: "
+            f"{format_price(automatic_sr_tolerance)}"
         )
 
         sr_rows = []
@@ -6826,18 +6040,12 @@ with st.expander(
                         include_dollar=False,
                     ),
                     "touches": level["touches"],
-                    "source_highs": (
-                        level["high_count"]
-                    ),
-                    "source_lows": (
-                        level["low_count"]
-                    ),
-                    "source_sessions": (
-                        ", ".join(
-                            str(session_date)
-                            for session_date
-                            in level["sessions"]
-                        )
+                    "source_highs": level["high_count"],
+                    "source_lows": level["low_count"],
+                    "source_sessions": ", ".join(
+                        str(session_date)
+                        for session_date
+                        in level["sessions"]
                     ),
                 }
             )
@@ -6849,12 +6057,9 @@ with st.expander(
         )
 
         st.caption(
-            (
-                "These historical levels exclude "
-                "the current partial session. "
-                "SESSION H and SESSION L are "
-                "displayed separately and can move."
-            )
+            "Historical levels exclude the current "
+            "partial session. SESSION H and SESSION L "
+            "are calculated separately."
         )
 
 
@@ -6895,7 +6100,6 @@ with st.expander(
         st.info(
             "No closed trades are recorded."
         )
-
     else:
         st.dataframe(
             trades_dataframe,
@@ -6932,12 +6136,8 @@ with st.expander(
 
     if events_dataframe.empty:
         st.info(
-            (
-                "No account-cycle events "
-                "are recorded."
-            )
+            "No account-cycle events are recorded."
         )
-
     else:
         st.dataframe(
             events_dataframe,
@@ -6984,17 +6184,17 @@ with st.expander(
 | Sessions used for S/R | `{completed_sessions_text}` |
 | Developing session H/L | `{"ON" if show_developing_session_hl else "OFF"}` |
 | Persistent drawings | `{len(persistent_drawings)}` |
+| S/R label rail width | `{label_rail_width} bars` |
 | Account cycle | `{account["cycle_number"]}` |
 | SQLite database | `{os.path.abspath(DB_PATH)}` |
 
-### Automatic S/R behavior
+### S/R label rail
 
-- Historical S/R uses the last five **completed** trading sessions.
-- The current partial session is excluded from those fixed levels.
-- The current session high and low are displayed separately.
-- Nearby historical highs/lows are merged into one level.
-- Maintenance closures, weekends, and other filtered closures do not count as bars.
-- Only revealed replay data is used; no future bars are included.
-- Manual drawings are saved by ticker and are not cleared by Start / Reset Replay.
+- Horizontal S/R lines remain at their exact prices.
+- `5S SUP / RES / PIVOT` labels are placed in the right rail.
+- `LOCAL FLOOR / CEIL / BOTH / BROKEN` labels are placed in the right rail.
+- `SESSION H / SESSION L` labels are placed in the right rail.
+- Persistent manual horizontal-line labels are placed in the right rail.
+- HH, HL, LH, LL, BOS, and CHoCH remain attached to their relevant candles.
 """
     )
