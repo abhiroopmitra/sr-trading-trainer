@@ -7,13 +7,15 @@
 # - Gapless sequential x-axis
 # - 100/200-bar Follow mode for continuous markets
 # - Current-session Follow mode for stocks
-# - Persistent SQLite wallet and positions
-# - Persistent manual drawings by ticker
+# - Persistent SQLite wallet, positions, trades, and drawings
 # - Manual drawing helper
-# - Structure labels and local S/R zones
-# - Automatic S/R from 5 completed sessions
-# - Developing current-session high and low
-# - Dedicated right-side S/R label rail
+# - Automatic S/R from five completed trading sessions
+# - Developing current-session high/low
+# - S/R labels outside the plotting area
+# - Major market structure from a higher timeframe
+# - ATR-based swing filtering
+# - Protected high/low BOS and CHoCH logic
+# - Consolidation suppression
 # ============================================================
 
 import json
@@ -143,27 +145,82 @@ DRAW_MODES = [
     "Trend line",
 ]
 
+STRUCTURE_SOURCE_OPTIONS = [
+    "Auto",
+    "5m",
+    "15m",
+    "1h",
+    "2h",
+    "4h",
+    "1d",
+]
+
+STRUCTURE_SOURCE_MINUTES = {
+    "1m": 1,
+    "2m": 2,
+    "5m": 5,
+    "15m": 15,
+    "30m": 30,
+    "90m": 90,
+    "1h": 60,
+    "2h": 120,
+    "4h": 240,
+    "1d": 1440,
+}
+
+STRUCTURE_RESAMPLE_RULES = {
+    "1m": "1min",
+    "2m": "2min",
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "90m": "90min",
+    "1h": "60min",
+    "2h": "120min",
+    "4h": "240min",
+    "1d": "1D",
+}
+
+AUTO_STRUCTURE_MAP = {
+    "1m": "5m",
+    "2m": "15m",
+    "5m": "15m",
+    "15m": "1h",
+    "30m": "2h",
+    "90m": "4h",
+    "1h": "4h",
+    "1d": "1d",
+}
+
+STRUCTURE_SENSITIVITY = {
+    "Strict": 1.00,
+    "Normal": 0.75,
+    "Sensitive": 0.50,
+}
+
 AUTO_SR_LOOKBACK_SESSIONS = 5
 
-# Right-side rail sizing.
-MIN_LABEL_RAIL_BARS = 16
-MAX_LABEL_RAIL_BARS = 34
-LABEL_RAIL_PERCENT = 0.18
+# Major structure parameters.
+MAJOR_PIVOT_K = 2
+ATR_LENGTH = 14
+BREAK_ATR_BUFFER = 0.10
+BREAK_BODY_ATR = 0.35
+RANGE_LOOKBACK_BARS = 8
+RANGE_WIDTH_ATR = 1.50
 
-# Structure settings.
-MAX_STRUCTURE_BARS = 700
-MAX_SWING_LABELS = 90
-MAX_BOS_LABELS = 30
-MAX_CHOCH_LABELS = 20
-MAX_ZONE_SWINGS = 180
-MAX_LOCAL_ZONES_DRAWN = 10
+# Local S/R parameters.
+LOCAL_SWING_K = 5
+LOCAL_ZONE_TOL = 0.0012
+LOCAL_MIN_TOUCHES = 2
+LOCAL_MIN_SWING_PCT = 0.0008
+LOCAL_POLARITY_EDGE = 2
+MAX_LOCAL_ZONE_SWINGS = 180
+MAX_LOCAL_ZONES_DRAWN = 8
 
-SWING_K = 5
-ZONE_TOL = 0.0012
-MIN_DRAW_TOUCHES = 2
-MIN_SWING_PCT = 0.0008
-POLARITY_EDGE = 2
-CHOCH_ENABLE = True
+# Right-side S/R label margin.
+OUTER_LABEL_X = 1.012
+OUTER_LABEL_MARGIN = 270
+RIGHT_CANDLE_PADDING = 6
 
 # Colors.
 C_HH = {"fg": "#ffffff", "bg": "#16a34a"}
@@ -171,27 +228,25 @@ C_LH = {"fg": "#ffffff", "bg": "#dc2626"}
 C_H = {"fg": "#ffffff", "bg": "#475569"}
 
 C_BOS_UP = {"fg": "#111111", "bg": "#fde047"}
-C_BOS_DN = {"fg": "#ffffff", "bg": "#dc2626"}
+C_BOS_DOWN = {"fg": "#ffffff", "bg": "#dc2626"}
+C_CHOCH_UP = {"fg": "#111111", "bg": "#7dd3fc"}
+C_CHOCH_DOWN = {"fg": "#111111", "bg": "#fb923c"}
 
-C_CH_UP = {"fg": "#111111", "bg": "#7dd3fc"}
-C_CH_DN = {"fg": "#111111", "bg": "#fb923c"}
-
-C_FLOOR = "#22c55e"
-C_CEIL = "#ef4444"
-C_BROKEN = "#a8a29e"
-C_BOTH = "#eab308"
-
-C_FAST_EMA = "#3b82f6"
-C_SLOW_EMA = "#f59e0b"
-C_VOL_MA = "#ff6d00"
+C_FAST_MA = "#3b82f6"
+C_SLOW_MA = "#f59e0b"
+C_VOLUME_MA = "#ff6d00"
 
 C_AUTO_SUPPORT = "#22c55e"
 C_AUTO_RESISTANCE = "#ef4444"
 C_AUTO_PIVOT = "#eab308"
 
-C_DEVELOPING_HIGH = "#38bdf8"
-C_DEVELOPING_LOW = "#c084fc"
+C_LOCAL_FLOOR = "#22c55e"
+C_LOCAL_CEILING = "#ef4444"
+C_LOCAL_BOTH = "#eab308"
+C_LOCAL_BROKEN = "#a8a29e"
 
+C_SESSION_HIGH = "#38bdf8"
+C_SESSION_LOW = "#c084fc"
 C_MANUAL_SR = "#eab308"
 
 
@@ -338,6 +393,25 @@ def bars_for_minutes(target_minutes, native_minutes):
         1,
         int(np.ceil(float(target_minutes) / float(native_minutes))),
     )
+
+
+def resolve_structure_source(chart_timeframe, selected_source):
+    if selected_source == "Auto":
+        requested_source = AUTO_STRUCTURE_MAP.get(
+            chart_timeframe,
+            chart_timeframe,
+        )
+    else:
+        requested_source = selected_source
+
+    chart_minutes = TIMEFRAME_CONFIG[chart_timeframe]["minutes"]
+    requested_minutes = STRUCTURE_SOURCE_MINUTES[requested_source]
+
+    # The app cannot reconstruct a lower timeframe from a higher one.
+    if requested_minutes < chart_minutes:
+        return chart_timeframe
+
+    return requested_source
 
 
 # ============================================================
@@ -492,17 +566,15 @@ def initialize_database():
         realized_pnl = 0.0
         cycle_number = 1
 
-        # Best-effort migration from the previous "accounts" table.
+        # Best-effort migration from the previous accounts table.
         if table_exists(connection, "accounts"):
             columns = table_columns(connection, "accounts")
 
-            required = {
+            if {
                 "cash_balance",
                 "realized_pnl",
                 "cycle_number",
-            }
-
-            if required.issubset(columns):
+            }.issubset(columns):
                 old_account = connection.execute(
                     """
                     SELECT *
@@ -546,7 +618,7 @@ def initialize_database():
                         )
                     )
 
-        # Best-effort migration from the oldest "account" table.
+        # Best-effort migration from the oldest account table.
         elif table_exists(connection, "account"):
             columns = table_columns(connection, "account")
 
@@ -619,6 +691,150 @@ def initialize_database():
                 now,
             ),
         )
+
+    # Best-effort migration of an old open position.
+    replay_position = cursor.execute(
+        """
+        SELECT account_id
+        FROM replay_positions
+        WHERE account_id = ?
+        """,
+        (ACCOUNT_ID,),
+    ).fetchone()
+
+    if replay_position is None and table_exists(connection, "positions"):
+        columns = table_columns(connection, "positions")
+
+        try:
+            if "account_id" in columns:
+                old_position = connection.execute(
+                    """
+                    SELECT *
+                    FROM positions
+                    WHERE account_id = ?
+                    LIMIT 1
+                    """,
+                    (ACCOUNT_ID,),
+                ).fetchone()
+            else:
+                old_position = connection.execute(
+                    """
+                    SELECT *
+                    FROM positions
+                    LIMIT 1
+                    """
+                ).fetchone()
+
+            if old_position is not None:
+                if "quantity" in columns:
+                    raw_quantity = float(
+                        row_value(
+                            old_position,
+                            "quantity",
+                            0.0,
+                        )
+                    )
+                else:
+                    raw_quantity = float(
+                        row_value(
+                            old_position,
+                            "qty",
+                            0.0,
+                        )
+                    )
+
+                if abs(raw_quantity) > 1e-12:
+                    side = row_value(
+                        old_position,
+                        "side",
+                        None,
+                    )
+
+                    if side not in {"long", "short"}:
+                        side = (
+                            "long"
+                            if raw_quantity > 0
+                            else "short"
+                        )
+
+                    ticker_value = str(
+                        row_value(
+                            old_position,
+                            "ticker",
+                            "MIXED",
+                        )
+                    )
+
+                    entry_price = float(
+                        row_value(
+                            old_position,
+                            "entry_price",
+                            0.0,
+                        )
+                    )
+
+                    stop_loss = row_value(
+                        old_position,
+                        "stop_loss",
+                        row_value(
+                            old_position,
+                            "sl",
+                            None,
+                        ),
+                    )
+
+                    target = row_value(
+                        old_position,
+                        "target",
+                        row_value(
+                            old_position,
+                            "tp",
+                            None,
+                        ),
+                    )
+
+                    if stop_loss == -1:
+                        stop_loss = None
+
+                    if target == -1:
+                        target = None
+
+                    cursor.execute(
+                        """
+                        INSERT INTO replay_positions (
+                            account_id,
+                            ticker,
+                            asset_class,
+                            side,
+                            quantity,
+                            entry_price,
+                            entry_time,
+                            stop_loss,
+                            target,
+                            invested_amount,
+                            last_mark_price,
+                            last_mark_time
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            ACCOUNT_ID,
+                            ticker_value,
+                            detect_asset_class(ticker_value),
+                            side,
+                            abs(raw_quantity),
+                            entry_price,
+                            now,
+                            stop_loss,
+                            target,
+                            abs(raw_quantity) * entry_price,
+                            entry_price,
+                            now,
+                        ),
+                    )
+
+        except Exception:
+            pass
 
     connection.commit()
     connection.close()
@@ -1053,7 +1269,7 @@ def clear_persistent_drawings(ticker):
 def add_horizontal_line(
     price,
     label="",
-    color="#22d3ee",
+    color=C_MANUAL_SR,
 ):
     add_persistent_drawing(
         st.session_state.active_ticker,
@@ -1444,7 +1660,6 @@ def apply_session_filter(
         return dataframe.copy()
 
     output = dataframe.copy()
-
     output["timestamp"] = pd.to_datetime(
         output["timestamp"]
     )
@@ -1873,7 +2088,7 @@ def disable_rangesliders(figure):
 
 
 # ============================================================
-# AUTOMATIC 5-SESSION SUPPORT / RESISTANCE
+# AUTOMATIC FIVE-SESSION S/R
 # ============================================================
 def compute_five_session_sr(
     revealed_dataframe,
@@ -1898,15 +2113,16 @@ def compute_five_session_sr(
         current_session_date
     )
 
-    completed_session_dates = sorted(
+    completed_sessions = sorted(
         {
             session_date
-            for session_date in working["_session"].unique()
+            for session_date
+            in working["_session"].unique()
             if session_date < current_session_date
         }
     )
 
-    selected_sessions = completed_session_dates[
+    selected_sessions = completed_sessions[
         -AUTO_SR_LOOKBACK_SESSIONS:
     ]
 
@@ -1916,7 +2132,7 @@ def compute_five_session_sr(
     candidates = []
     session_ranges = []
 
-    for sequence, session_date_value in enumerate(
+    for recency, session_date_value in enumerate(
         selected_sessions,
         start=1,
     ):
@@ -1944,7 +2160,7 @@ def compute_five_session_sr(
                 "price": session_high,
                 "kind": "H",
                 "session": session_date_value,
-                "recency": sequence,
+                "recency": recency,
             }
         )
 
@@ -1953,22 +2169,22 @@ def compute_five_session_sr(
                 "price": session_low,
                 "kind": "L",
                 "session": session_date_value,
-                "recency": sequence,
+                "recency": recency,
             }
         )
 
     if not candidates:
         return [], selected_sessions, 0.0
 
-    valid_ranges = [
+    positive_ranges = [
         value
         for value in session_ranges
         if value > 0
     ]
 
     median_session_range = (
-        float(np.median(valid_ranges))
-        if valid_ranges
+        float(np.median(positive_ranges))
+        if positive_ranges
         else 0.0
     )
 
@@ -1980,27 +2196,21 @@ def compute_five_session_sr(
 
     sorted_candidates = sorted(
         candidates,
-        key=lambda candidate: candidate["price"],
+        key=lambda item: item["price"],
     )
 
     clusters = []
 
     for candidate in sorted_candidates:
         if not clusters:
-            clusters.append(
-                {
-                    "candidates": [candidate],
-                }
-            )
+            clusters.append([candidate])
             continue
-
-        previous_cluster = clusters[-1]
 
         cluster_center = float(
             np.median(
                 [
                     item["price"]
-                    for item in previous_cluster["candidates"]
+                    for item in clusters[-1]
                 ]
             )
         )
@@ -2009,155 +2219,78 @@ def compute_five_session_sr(
             abs(candidate["price"] - cluster_center)
             <= merge_tolerance
         ):
-            previous_cluster["candidates"].append(
-                candidate
-            )
+            clusters[-1].append(candidate)
         else:
-            clusters.append(
-                {
-                    "candidates": [candidate],
-                }
-            )
+            clusters.append([candidate])
 
     levels = []
 
-    for cluster_index, cluster in enumerate(clusters):
-        cluster_candidates = cluster["candidates"]
-
-        cluster_prices = [
+    for cluster in clusters:
+        prices = [
             item["price"]
-            for item in cluster_candidates
+            for item in cluster
         ]
 
-        center_price = float(
-            np.median(cluster_prices)
+        level_price = float(
+            np.median(prices)
         )
 
+        touches = len(cluster)
         high_count = sum(
-            1
-            for item in cluster_candidates
-            if item["kind"] == "H"
+            item["kind"] == "H"
+            for item in cluster
         )
-
         low_count = sum(
-            1
-            for item in cluster_candidates
-            if item["kind"] == "L"
+            item["kind"] == "L"
+            for item in cluster
         )
-
         recency_score = sum(
             item["recency"]
-            for item in cluster_candidates
+            for item in cluster
+        )
+
+        normalized_distance = (
+            abs(level_price - current_price)
+            / max(abs(current_price), 1e-12)
+        )
+
+        score = (
+            touches * 10
+            + recency_score
+            - normalized_distance
         )
 
         levels.append(
             {
-                "cluster_index": cluster_index,
-                "price": center_price,
-                "zone_low": float(min(cluster_prices)),
-                "zone_high": float(max(cluster_prices)),
-                "touches": len(cluster_candidates),
-                "high_count": high_count,
-                "low_count": low_count,
-                "recency_score": recency_score,
+                "price": level_price,
+                "zone_low": float(min(prices)),
+                "zone_high": float(max(prices)),
+                "touches": touches,
+                "high_count": int(high_count),
+                "low_count": int(low_count),
                 "sessions": sorted(
                     {
                         item["session"]
-                        for item in cluster_candidates
+                        for item in cluster
                     }
                 ),
+                "score": score,
             }
         )
 
-    if not levels:
-        return [], selected_sessions, merge_tolerance
-
-    raw_minimum = min(
-        candidate["price"]
-        for candidate in candidates
-    )
-
-    raw_maximum = max(
-        candidate["price"]
-        for candidate in candidates
-    )
-
-    most_recent_session = selected_sessions[-1]
-
-    mandatory_indices = set()
-
-    for level_index, level in enumerate(levels):
-        cluster_candidates = clusters[
-            level["cluster_index"]
-        ]["candidates"]
-
-        cluster_prices = [
-            item["price"]
-            for item in cluster_candidates
-        ]
-
-        if raw_minimum in cluster_prices:
-            mandatory_indices.add(level_index)
-
-        if raw_maximum in cluster_prices:
-            mandatory_indices.add(level_index)
-
-        if any(
-            item["session"] == most_recent_session
-            for item in cluster_candidates
-        ):
-            mandatory_indices.add(level_index)
-
-    def importance(level):
-        distance = abs(
-            level["price"] - float(current_price)
-        )
-
-        normalized_distance = (
-            distance
-            / max(abs(float(current_price)), 1e-12)
-        )
-
-        return (
-            level["touches"] * 10
-            + level["recency_score"]
-            - normalized_distance
-        )
-
-    ranked_indices = sorted(
-        range(len(levels)),
-        key=lambda index: importance(levels[index]),
+    levels = sorted(
+        levels,
+        key=lambda level: level["score"],
         reverse=True,
-    )
+    )[:int(max_levels)]
 
-    selected_indices = []
-
-    for index in sorted(mandatory_indices):
-        if index not in selected_indices:
-            selected_indices.append(index)
-
-        if len(selected_indices) >= max_levels:
-            break
-
-    for index in ranked_indices:
-        if len(selected_indices) >= max_levels:
-            break
-
-        if index not in selected_indices:
-            selected_indices.append(index)
-
-    selected_levels = [
-        levels[index]
-        for index in selected_indices
-    ]
-
-    selected_levels = sorted(
-        selected_levels,
+    levels = sorted(
+        levels,
         key=lambda level: level["price"],
     )
 
     return (
-        selected_levels,
+        levels,
         selected_sessions,
         merge_tolerance,
     )
@@ -2174,58 +2307,56 @@ def get_developing_session_levels(
         current_session_date
     )
 
-    session_rows = revealed_dataframe[
-        revealed_dataframe["session_date"].map(to_pydate)
+    current_rows = revealed_dataframe[
+        revealed_dataframe["session_date"]
+        .map(to_pydate)
         == current_session_date
     ]
 
-    if session_rows.empty:
+    if current_rows.empty:
         return None
 
     return {
-        "high": float(session_rows["high"].max()),
-        "low": float(session_rows["low"].min()),
-        "bars": len(session_rows),
+        "high": float(current_rows["high"].max()),
+        "low": float(current_rows["low"].min()),
+        "bars": len(current_rows),
     }
 
 
 # ============================================================
-# LOCAL MARKET STRUCTURE
+# LOCAL CHART S/R
 # ============================================================
-def raw_swings(dataframe):
+def detect_local_swings(dataframe):
     if (
         dataframe is None
-        or len(dataframe) < SWING_K * 2 + 1
+        or len(dataframe)
+        < LOCAL_SWING_K * 2 + 1
     ):
         return []
 
-    highs = dataframe["high"].values
-    lows = dataframe["low"].values
-    row_count = len(dataframe)
-
-    reference_price = float(
-        dataframe["close"].iloc[-1]
-    )
+    highs = dataframe["high"].to_numpy()
+    lows = dataframe["low"].to_numpy()
 
     minimum_size = max(
-        reference_price * MIN_SWING_PCT,
+        float(dataframe["close"].iloc[-1])
+        * LOCAL_MIN_SWING_PCT,
         1e-12,
     )
 
     raw = []
 
     for index in range(
-        SWING_K,
-        row_count - SWING_K,
+        LOCAL_SWING_K,
+        len(dataframe) - LOCAL_SWING_K,
     ):
         high_window = highs[
-            index - SWING_K:
-            index + SWING_K + 1
+            index - LOCAL_SWING_K:
+            index + LOCAL_SWING_K + 1
         ]
 
         low_window = lows[
-            index - SWING_K:
-            index + SWING_K + 1
+            index - LOCAL_SWING_K:
+            index + LOCAL_SWING_K + 1
         ]
 
         if (
@@ -2234,11 +2365,11 @@ def raw_swings(dataframe):
             >= minimum_size
         ):
             raw.append(
-                (
-                    index,
-                    float(highs[index]),
-                    "H",
-                )
+                {
+                    "i": index,
+                    "price": float(highs[index]),
+                    "type": "H",
+                }
             )
 
         if (
@@ -2247,95 +2378,61 @@ def raw_swings(dataframe):
             >= minimum_size
         ):
             raw.append(
-                (
-                    index,
-                    float(lows[index]),
-                    "L",
-                )
+                {
+                    "i": index,
+                    "price": float(lows[index]),
+                    "type": "L",
+                }
             )
 
-    raw.sort(key=lambda value: value[0])
+    raw = sorted(
+        raw,
+        key=lambda swing: swing["i"],
+    )
 
     cleaned = []
 
     for swing in raw:
         if (
             cleaned
-            and cleaned[-1][2] == swing[2]
+            and cleaned[-1]["type"] == swing["type"]
         ):
             previous = cleaned[-1]
 
             if (
-                swing[2] == "H"
-                and swing[1] >= previous[1]
+                swing["type"] == "H"
+                and swing["price"] >= previous["price"]
             ):
                 cleaned[-1] = swing
 
             elif (
-                swing[2] == "L"
-                and swing[1] <= previous[1]
+                swing["type"] == "L"
+                and swing["price"] <= previous["price"]
             ):
                 cleaned[-1] = swing
+
         else:
             cleaned.append(swing)
 
-    labeled = []
-    previous_high = None
-    previous_low = None
-
-    for index, price, swing_type in cleaned:
-        if swing_type == "H":
-            if previous_high is None:
-                label = "H"
-            elif price > previous_high:
-                label = "HH"
-            else:
-                label = "LH"
-
-            previous_high = price
-
-        else:
-            if previous_low is None:
-                label = "L"
-            elif price > previous_low:
-                label = "HL"
-            else:
-                label = "LL"
-
-            previous_low = price
-
-        labeled.append(
-            {
-                "i": index,
-                "price": price,
-                "type": swing_type,
-                "label": label,
-            }
-        )
-
-    return labeled
+    return cleaned
 
 
 def build_local_zones(
-    labeled_swings,
+    swings,
     reference_price,
 ):
     zones = []
 
-    for swing in labeled_swings:
+    for swing in swings:
         placed = False
 
         for zone in zones:
-            distance = abs(
-                swing["price"] - zone["mid"]
-            )
-
             normalized_distance = (
-                distance
-                / max(reference_price, 1e-12)
+                abs(swing["price"] - zone["mid"])
+                / max(abs(reference_price), 1e-12)
             )
 
-            if normalized_distance < ZONE_TOL:
+            if normalized_distance < LOCAL_ZONE_TOL:
                 zone["prices"].append(
                     swing["price"]
                 )
@@ -2376,7 +2473,7 @@ def build_local_zones(
     output = [
         zone
         for zone in zones
-        if zone["touches"] >= MIN_DRAW_TOUCHES
+        if zone["touches"] >= LOCAL_MIN_TOUCHES
     ]
 
     for zone in output:
@@ -2386,130 +2483,22 @@ def build_local_zones(
     return output
 
 
-def detect_bos_choch(
-    dataframe,
-    labeled_swings,
-):
-    bos_events = []
-    choch_events = []
-
-    last_hh = None
-    last_hl = None
-    last_lh = None
-    last_ll = None
-
-    bias = "NEUTRAL"
-    pointer = 0
-
-    for index in range(len(dataframe)):
-        while (
-            pointer < len(labeled_swings)
-            and labeled_swings[pointer]["i"] + SWING_K
-            <= index
-        ):
-            swing = labeled_swings[pointer]
-
-            if swing["label"] == "HH":
-                last_hh = swing["price"]
-            elif swing["label"] == "HL":
-                last_hl = swing["price"]
-            elif swing["label"] == "LH":
-                last_lh = swing["price"]
-            elif swing["label"] == "LL":
-                last_ll = swing["price"]
-
-            pointer += 1
-
-        close_price = float(
-            dataframe["close"].iloc[index]
-        )
-
-        if (
-            last_hh is not None
-            and close_price > last_hh
-        ):
-            if bias != "BULL":
-                bos_events.append(
-                    {
-                        "i": index,
-                        "price": last_hh,
-                        "dir": "up",
-                    }
-                )
-
-                bias = "BULL"
-
-            last_hh = None
-            continue
-
-        if (
-            last_ll is not None
-            and close_price < last_ll
-        ):
-            if bias != "BEAR":
-                bos_events.append(
-                    {
-                        "i": index,
-                        "price": last_ll,
-                        "dir": "down",
-                    }
-                )
-
-                bias = "BEAR"
-
-            last_ll = None
-            continue
-
-        if CHOCH_ENABLE:
-            if (
-                bias == "BULL"
-                and last_hl is not None
-                and close_price < last_hl
-            ):
-                choch_events.append(
-                    {
-                        "i": index,
-                        "price": last_hl,
-                        "dir": "down",
-                    }
-                )
-
-                last_hl = None
-                bias = "NEUTRAL"
-
-            elif (
-                bias == "BEAR"
-                and last_lh is not None
-                and close_price > last_lh
-            ):
-                choch_events.append(
-                    {
-                        "i": index,
-                        "price": last_lh,
-                        "dir": "up",
-                    }
-                )
-
-                last_lh = None
-                bias = "NEUTRAL"
-
-    return bos_events, choch_events
-
-
 def local_zone_role(
     zone,
-    close_price,
+    current_price,
     noise,
 ):
     if (
         zone["low_touches"]
-        >= zone["high_touches"] + POLARITY_EDGE
+        >= zone["high_touches"]
+        + LOCAL_POLARITY_EDGE
     ):
         role = "floor"
 
     elif (
         zone["high_touches"]
-        >= zone["low_touches"] + POLARITY_EDGE
+        >= zone["low_touches"]
+        + LOCAL_POLARITY_EDGE
     ):
         role = "ceiling"
 
@@ -2518,20 +2507,722 @@ def local_zone_role(
 
     if (
         role == "floor"
-        and close_price < zone["min_px"] - noise
+        and current_price
+        < zone["min_px"] - noise
     ):
         return "broken_floor"
 
     if (
         role == "ceiling"
-        and close_price > zone["max_px"] + noise
+        and current_price
+        > zone["max_px"] + noise
     ):
         return "broken_ceiling"
 
     return role
 
 
-def add_badge(
+# ============================================================
+# MAJOR MARKET STRUCTURE
+# ============================================================
+def aggregate_structure_bars(
+    revealed_dataframe,
+    chart_timeframe,
+    structure_source,
+    current_timestamp,
+):
+    if revealed_dataframe.empty:
+        return pd.DataFrame()
+
+    source_minutes = STRUCTURE_SOURCE_MINUTES[
+        structure_source
+    ]
+
+    chart_minutes = TIMEFRAME_CONFIG[
+        chart_timeframe
+    ]["minutes"]
+
+    columns = [
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    ]
+
+    source = (
+        revealed_dataframe[columns]
+        .copy()
+        .sort_values("timestamp")
+    )
+
+    if (
+        source_minutes <= chart_minutes
+        or structure_source == chart_timeframe
+    ):
+        return source.reset_index(drop=True)
+
+    indexed = (
+        source
+        .set_index("timestamp")
+        .sort_index()
+    )
+
+    rule = STRUCTURE_RESAMPLE_RULES[
+        structure_source
+    ]
+
+    aggregated = (
+        indexed
+        .resample(
+            rule,
+            label="left",
+            closed="left",
+            origin="start_day",
+        )
+        .agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            }
+        )
+        .dropna(
+            subset=[
+                "open",
+                "high",
+                "low",
+                "close",
+            ]
+        )
+        .reset_index()
+    )
+
+    # Exclude the current incomplete higher-timeframe candle.
+    if source_minutes < 1440:
+        bar_duration = pd.Timedelta(
+            minutes=source_minutes
+        )
+
+        aggregated = aggregated[
+            aggregated["timestamp"] + bar_duration
+            <= pd.Timestamp(current_timestamp)
+        ].copy()
+
+    return aggregated.reset_index(drop=True)
+
+
+def calculate_atr(dataframe, length=14):
+    if dataframe.empty:
+        return pd.Series(dtype=float)
+
+    previous_close = (
+        dataframe["close"].shift(1)
+    )
+
+    true_range = pd.concat(
+        [
+            dataframe["high"] - dataframe["low"],
+            (
+                dataframe["high"]
+                - previous_close
+            ).abs(),
+            (
+                dataframe["low"]
+                - previous_close
+            ).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    atr = true_range.ewm(
+        alpha=1.0 / float(length),
+        adjust=False,
+        min_periods=min(5, int(length)),
+    ).mean()
+
+    fallback = true_range.rolling(
+        min(5, int(length)),
+        min_periods=1,
+    ).mean()
+
+    return atr.fillna(fallback)
+
+
+def detect_major_swings(
+    structure_dataframe,
+    atr_multiplier,
+):
+    if (
+        structure_dataframe.empty
+        or len(structure_dataframe)
+        < MAJOR_PIVOT_K * 2 + 1
+    ):
+        return []
+
+    highs = structure_dataframe["high"].to_numpy()
+    lows = structure_dataframe["low"].to_numpy()
+    atr_values = structure_dataframe["atr"].to_numpy()
+
+    candidates = []
+
+    for index in range(
+        MAJOR_PIVOT_K,
+        len(structure_dataframe) - MAJOR_PIVOT_K,
+    ):
+        high_window = highs[
+            index - MAJOR_PIVOT_K:
+            index + MAJOR_PIVOT_K + 1
+        ]
+
+        low_window = lows[
+            index - MAJOR_PIVOT_K:
+            index + MAJOR_PIVOT_K + 1
+        ]
+
+        confirmation_index = (
+            index + MAJOR_PIVOT_K
+        )
+
+        if highs[index] == high_window.max():
+            candidates.append(
+                {
+                    "i": index,
+                    "price": float(highs[index]),
+                    "type": "H",
+                    "atr": float(atr_values[index]),
+                    "timestamp": pd.Timestamp(
+                        structure_dataframe[
+                            "timestamp"
+                        ].iloc[index]
+                    ),
+                    "confirmed_at": pd.Timestamp(
+                        structure_dataframe[
+                            "timestamp"
+                        ].iloc[confirmation_index]
+                    ),
+                    "confirmation_i": confirmation_index,
+                }
+            )
+
+        if lows[index] == low_window.min():
+            candidates.append(
+                {
+                    "i": index,
+                    "price": float(lows[index]),
+                    "type": "L",
+                    "atr": float(atr_values[index]),
+                    "timestamp": pd.Timestamp(
+                        structure_dataframe[
+                            "timestamp"
+                        ].iloc[index]
+                    ),
+                    "confirmed_at": pd.Timestamp(
+                        structure_dataframe[
+                            "timestamp"
+                        ].iloc[confirmation_index]
+                    ),
+                    "confirmation_i": confirmation_index,
+                }
+            )
+
+    candidates = sorted(
+        candidates,
+        key=lambda swing: (
+            swing["i"],
+            swing["type"],
+        ),
+    )
+
+    alternating = []
+
+    for candidate in candidates:
+        if not alternating:
+            alternating.append(candidate)
+            continue
+
+        previous = alternating[-1]
+
+        if candidate["type"] == previous["type"]:
+            if (
+                candidate["type"] == "H"
+                and candidate["price"] >= previous["price"]
+            ):
+                alternating[-1] = candidate
+
+            elif (
+                candidate["type"] == "L"
+                and candidate["price"] <= previous["price"]
+            ):
+                alternating[-1] = candidate
+
+            continue
+
+        threshold = max(
+            float(candidate["atr"])
+            * float(atr_multiplier),
+            1e-12,
+        )
+
+        movement = abs(
+            candidate["price"]
+            - previous["price"]
+        )
+
+        if movement >= threshold:
+            alternating.append(candidate)
+
+    previous_high = None
+    previous_low = None
+    labeled = []
+
+    for swing in alternating:
+        swing = swing.copy()
+
+        if swing["type"] == "H":
+            if previous_high is None:
+                swing["label"] = "H"
+            elif swing["price"] > previous_high:
+                swing["label"] = "HH"
+            else:
+                swing["label"] = "LH"
+
+            previous_high = swing["price"]
+
+        else:
+            if previous_low is None:
+                swing["label"] = "L"
+            elif swing["price"] > previous_low:
+                swing["label"] = "HL"
+            else:
+                swing["label"] = "LL"
+
+            previous_low = swing["price"]
+
+        confirmation_index = min(
+            swing["confirmation_i"],
+            len(structure_dataframe) - 1,
+        )
+
+        swing["in_range"] = bool(
+            structure_dataframe[
+                "in_range"
+            ].iloc[confirmation_index]
+        )
+
+        labeled.append(swing)
+
+    return labeled
+
+
+def detect_major_breaks(
+    structure_dataframe,
+    major_swings,
+):
+    if structure_dataframe.empty:
+        return [], "NEUTRAL", None, None
+
+    swings_by_confirmation = sorted(
+        major_swings,
+        key=lambda swing: swing["confirmed_at"],
+    )
+
+    pointer = 0
+    last_high = None
+    last_low = None
+
+    protected_high = None
+    protected_low = None
+
+    broken_highs = set()
+    broken_lows = set()
+
+    bias = "NEUTRAL"
+    events = []
+
+    for _, row in structure_dataframe.iterrows():
+        timestamp = pd.Timestamp(
+            row["timestamp"]
+        )
+
+        while (
+            pointer < len(swings_by_confirmation)
+            and swings_by_confirmation[pointer][
+                "confirmed_at"
+            ] <= timestamp
+        ):
+            swing = swings_by_confirmation[
+                pointer
+            ]
+
+            if swing["type"] == "H":
+                last_high = swing
+            else:
+                last_low = swing
+
+            pointer += 1
+
+        atr_value = max(
+            float(row["atr"]),
+            1e-12,
+        )
+
+        buffer_value = (
+            atr_value * BREAK_ATR_BUFFER
+        )
+
+        body_size = abs(
+            float(row["close"])
+            - float(row["open"])
+        )
+
+        strong_body = (
+            body_size
+            >= atr_value * BREAK_BODY_ATR
+        )
+
+        close_price = float(row["close"])
+        open_price = float(row["open"])
+
+        # ----------------------------------------------------
+        # Existing bullish structure
+        # ----------------------------------------------------
+        if bias == "BULLISH":
+            if protected_low is not None:
+                break_level = float(
+                    protected_low["price"]
+                )
+
+                downside_gap = (
+                    open_price
+                    < break_level - buffer_value
+                )
+
+                if (
+                    close_price
+                    < break_level - buffer_value
+                    and (strong_body or downside_gap)
+                ):
+                    events.append(
+                        {
+                            "type": "CHoCH",
+                            "dir": "down",
+                            "timestamp": timestamp,
+                            "price": break_level,
+                            "plot_y": float(row["low"]),
+                        }
+                    )
+
+                    bias = "BEARISH"
+                    protected_high = last_high
+                    protected_low = None
+
+                    continue
+
+            if last_high is not None:
+                swing_id = str(
+                    last_high["timestamp"]
+                )
+
+                break_level = float(
+                    last_high["price"]
+                )
+
+                upside_gap = (
+                    open_price
+                    > break_level + buffer_value
+                )
+
+                if (
+                    swing_id not in broken_highs
+                    and close_price
+                    > break_level + buffer_value
+                    and (strong_body or upside_gap)
+                ):
+                    events.append(
+                        {
+                            "type": "BOS",
+                            "dir": "up",
+                            "timestamp": timestamp,
+                            "price": break_level,
+                            "plot_y": float(row["high"]),
+                        }
+                    )
+
+                    broken_highs.add(swing_id)
+
+                    if last_low is not None:
+                        protected_low = last_low
+
+                    continue
+
+        # ----------------------------------------------------
+        # Existing bearish structure
+        # ----------------------------------------------------
+        elif bias == "BEARISH":
+            if protected_high is not None:
+                break_level = float(
+                    protected_high["price"]
+                )
+
+                upside_gap = (
+                    open_price
+                    > break_level + buffer_value
+                )
+
+                if (
+                    close_price
+                    > break_level + buffer_value
+                    and (strong_body or upside_gap)
+                ):
+                    events.append(
+                        {
+                            "type": "CHoCH",
+                            "dir": "up",
+                            "timestamp": timestamp,
+                            "price": break_level,
+                            "plot_y": float(row["high"]),
+                        }
+                    )
+
+                    bias = "BULLISH"
+                    protected_low = last_low
+                    protected_high = None
+
+                    continue
+
+            if last_low is not None:
+                swing_id = str(
+                    last_low["timestamp"]
+                )
+
+                break_level = float(
+                    last_low["price"]
+                )
+
+                downside_gap = (
+                    open_price
+                    < break_level - buffer_value
+                )
+
+                if (
+                    swing_id not in broken_lows
+                    and close_price
+                    < break_level - buffer_value
+                    and (strong_body or downside_gap)
+                ):
+                    events.append(
+                        {
+                            "type": "BOS",
+                            "dir": "down",
+                            "timestamp": timestamp,
+                            "price": break_level,
+                            "plot_y": float(row["low"]),
+                        }
+                    )
+
+                    broken_lows.add(swing_id)
+
+                    if last_high is not None:
+                        protected_high = last_high
+
+                    continue
+
+        # ----------------------------------------------------
+        # Neutral: first confirmed directional break
+        # ----------------------------------------------------
+        else:
+            if last_high is not None:
+                swing_id = str(
+                    last_high["timestamp"]
+                )
+
+                break_level = float(
+                    last_high["price"]
+                )
+
+                upside_gap = (
+                    open_price
+                    > break_level + buffer_value
+                )
+
+                if (
+                    swing_id not in broken_highs
+                    and close_price
+                    > break_level + buffer_value
+                    and (strong_body or upside_gap)
+                ):
+                    events.append(
+                        {
+                            "type": "BOS",
+                            "dir": "up",
+                            "timestamp": timestamp,
+                            "price": break_level,
+                            "plot_y": float(row["high"]),
+                        }
+                    )
+
+                    broken_highs.add(swing_id)
+                    protected_low = last_low
+                    bias = "BULLISH"
+
+                    continue
+
+            if last_low is not None:
+                swing_id = str(
+                    last_low["timestamp"]
+                )
+
+                break_level = float(
+                    last_low["price"]
+                )
+
+                downside_gap = (
+                    open_price
+                    < break_level - buffer_value
+                )
+
+                if (
+                    swing_id not in broken_lows
+                    and close_price
+                    < break_level - buffer_value
+                    and (strong_body or downside_gap)
+                ):
+                    events.append(
+                        {
+                            "type": "BOS",
+                            "dir": "down",
+                            "timestamp": timestamp,
+                            "price": break_level,
+                            "plot_y": float(row["low"]),
+                        }
+                    )
+
+                    broken_lows.add(swing_id)
+                    protected_high = last_high
+                    bias = "BEARISH"
+
+                    continue
+
+    return (
+        events,
+        bias,
+        protected_high,
+        protected_low,
+    )
+
+
+def compute_major_structure(
+    revealed_dataframe,
+    chart_timeframe,
+    structure_source,
+    current_timestamp,
+    sensitivity_name,
+):
+    structure_dataframe = aggregate_structure_bars(
+        revealed_dataframe,
+        chart_timeframe,
+        structure_source,
+        current_timestamp,
+    )
+
+    if structure_dataframe.empty:
+        return {
+            "dataframe": pd.DataFrame(),
+            "swings": [],
+            "events": [],
+            "bias": "NEUTRAL",
+            "status": "NEUTRAL",
+            "protected_high": None,
+            "protected_low": None,
+        }
+
+    structure_dataframe["atr"] = calculate_atr(
+        structure_dataframe,
+        ATR_LENGTH,
+    )
+
+    recent_high = (
+        structure_dataframe["high"]
+        .rolling(
+            RANGE_LOOKBACK_BARS,
+            min_periods=min(
+                5,
+                RANGE_LOOKBACK_BARS,
+            ),
+        )
+        .max()
+    )
+
+    recent_low = (
+        structure_dataframe["low"]
+        .rolling(
+            RANGE_LOOKBACK_BARS,
+            min_periods=min(
+                5,
+                RANGE_LOOKBACK_BARS,
+            ),
+        )
+        .min()
+    )
+
+    recent_width = recent_high - recent_low
+
+    structure_dataframe["in_range"] = (
+        recent_width
+        <= (
+            structure_dataframe["atr"]
+            * RANGE_WIDTH_ATR
+        )
+    ).fillna(False)
+
+    atr_multiplier = STRUCTURE_SENSITIVITY[
+        sensitivity_name
+    ]
+
+    major_swings = detect_major_swings(
+        structure_dataframe,
+        atr_multiplier,
+    )
+
+    (
+        events,
+        bias,
+        protected_high,
+        protected_low,
+    ) = detect_major_breaks(
+        structure_dataframe,
+        major_swings,
+    )
+
+    currently_in_range = bool(
+        structure_dataframe["in_range"].iloc[-1]
+    )
+
+    status = (
+        "RANGE"
+        if currently_in_range
+        else bias
+    )
+
+    return {
+        "dataframe": structure_dataframe,
+        "swings": major_swings,
+        "events": events,
+        "bias": bias,
+        "status": status,
+        "protected_high": protected_high,
+        "protected_low": protected_low,
+    }
+
+
+# ============================================================
+# ANNOTATION HELPERS
+# ============================================================
+def add_structure_badge(
     figure,
     x_value,
     y_value,
@@ -2540,10 +3231,6 @@ def add_badge(
     y_shift=0,
     arrow=False,
 ):
-    """
-    Used only for candle-specific market-structure labels.
-    These labels stay next to the swing candle.
-    """
     figure.add_annotation(
         x=x_value,
         y=y_value,
@@ -2553,47 +3240,47 @@ def add_badge(
         showarrow=arrow,
         arrowhead=2,
         arrowsize=1,
-        arrowwidth=1.2,
+        arrowwidth=1.1,
         arrowcolor="#e5e7eb",
         yshift=y_shift,
         font={
-            "size": 10,
+            "size": 9,
             "color": palette["fg"],
             "family": "Arial",
         },
         bgcolor=palette["bg"],
         bordercolor="#e5e7eb",
         borderwidth=1,
-        borderpad=3,
-        opacity=1,
+        borderpad=2,
+        opacity=0.96,
     )
 
 
-def add_rail_label(
+def add_outer_sr_label(
     figure,
-    x_value,
     y_value,
     text,
     background_color,
     foreground_color="#ffffff",
     border_color="#e5e7eb",
-    font_size=9,
 ):
     """
-    Places an S/R label in the dedicated right-side rail.
-    The corresponding horizontal line remains at the exact price.
+    Places the label in Plotly's outer right margin.
+
+    xref='paper', x > 1 means the label is outside the
+    plotting area and cannot cover any candles.
     """
     figure.add_annotation(
-        x=x_value,
+        x=OUTER_LABEL_X,
+        xref="paper",
         y=float(y_value),
-        row=1,
-        col=1,
+        yref="y",
         xanchor="left",
         yanchor="middle",
         text=f"<b>{text}</b>",
         showarrow=False,
         font={
-            "size": font_size,
+            "size": 9,
             "color": foreground_color,
             "family": "Arial",
         },
@@ -2601,8 +3288,43 @@ def add_rail_label(
         bordercolor=border_color,
         borderwidth=1,
         borderpad=3,
-        opacity=0.94,
+        opacity=0.96,
         align="left",
+    )
+
+
+def chart_x_for_timestamp(
+    chart_dataframe,
+    timestamp,
+):
+    if chart_dataframe.empty:
+        return None
+
+    timestamp = pd.Timestamp(timestamp)
+
+    first_time = pd.Timestamp(
+        chart_dataframe["timestamp"].iloc[0]
+    )
+
+    last_time = pd.Timestamp(
+        chart_dataframe["timestamp"].iloc[-1]
+    )
+
+    if timestamp < first_time or timestamp > last_time:
+        return None
+
+    differences = (
+        chart_dataframe["timestamp"]
+        - timestamp
+    ).abs()
+
+    nearest_index = differences.idxmin()
+
+    return float(
+        chart_dataframe.loc[
+            nearest_index,
+            "x_index",
+        ]
     )
 
 
@@ -2751,11 +3473,9 @@ def close_position(
 
     else:
         position["quantity"] = remaining_quantity
-
         position["invested_amount"] = (
             remaining_quantity * entry_price
         )
-
         position["last_mark_price"] = exit_price
         position["last_mark_time"] = str(timestamp)
 
@@ -3181,9 +3901,7 @@ def process_drawing_click(
 
         add_horizontal_line(
             price,
-            label=(
-                f"H {format_price(price, False)}"
-            ),
+            label=f"H {format_price(price, False)}",
             color="#ef4444",
         )
 
@@ -3197,9 +3915,7 @@ def process_drawing_click(
 
         add_horizontal_line(
             price,
-            label=(
-                f"C {format_price(price, False)}"
-            ),
+            label=f"C {format_price(price, False)}",
             color="#22d3ee",
         )
 
@@ -3213,9 +3929,7 @@ def process_drawing_click(
 
         add_horizontal_line(
             price,
-            label=(
-                f"L {format_price(price, False)}"
-            ),
+            label=f"L {format_price(price, False)}",
             color="#22c55e",
         )
 
@@ -3457,10 +4171,11 @@ else:
         first_date = available_dates[0]
         last_date = available_dates[-1]
 
-        if len(available_dates) >= 3:
-            default_practice_date = available_dates[-3]
-        else:
-            default_practice_date = available_dates[-1]
+        default_practice_date = (
+            available_dates[-3]
+            if len(available_dates) >= 3
+            else available_dates[-1]
+        )
 
         st.sidebar.success(
             f"{len(filtered_dataframe):,} session bars\n"
@@ -3586,7 +4301,7 @@ carry_positions = st.sidebar.checkbox(
 
 st.sidebar.caption(
     "When off, an open position is closed "
-    "at the last bar of the trading session."
+    "at the trading-session boundary."
 )
 
 
@@ -3662,9 +4377,71 @@ st.sidebar.subheader(
 
 show_structure_labels = (
     st.sidebar.checkbox(
-        "Show structure labels",
-        value=False,
+        "Show major structure labels",
+        value=True,
     )
+)
+
+structure_source_selection = (
+    st.sidebar.selectbox(
+        "Major structure timeframe",
+        STRUCTURE_SOURCE_OPTIONS,
+        index=0,
+        disabled=not show_structure_labels,
+    )
+)
+
+applied_structure_source = (
+    resolve_structure_source(
+        timeframe,
+        structure_source_selection,
+    )
+)
+
+structure_sensitivity = (
+    st.sidebar.selectbox(
+        "Swing sensitivity",
+        [
+            "Strict",
+            "Normal",
+            "Sensitive",
+        ],
+        index=1,
+        disabled=not show_structure_labels,
+    )
+)
+
+suppress_range_swings = (
+    st.sidebar.checkbox(
+        "Suppress swing labels inside ranges",
+        value=True,
+        disabled=not show_structure_labels,
+    )
+)
+
+show_structure_breaks = (
+    st.sidebar.checkbox(
+        "Show major BOS / CHoCH",
+        value=True,
+        disabled=not show_structure_labels,
+    )
+)
+
+maximum_structure_labels = (
+    st.sidebar.selectbox(
+        "Maximum major swing labels",
+        [4, 6, 8],
+        index=1,
+        disabled=not show_structure_labels,
+    )
+)
+
+st.sidebar.caption(
+    f"Applied major structure source: "
+    f"`{applied_structure_source}`.\n\n"
+    "Major swings require an ATR-sized move. "
+    "BOS and CHoCH require a candle close beyond "
+    "the protected level plus an ATR buffer."
 )
 
 show_local_sr_zones = (
@@ -3672,8 +4449,8 @@ show_local_sr_zones = (
         "Show local chart S/R zones",
         value=False,
         help=(
-            "Uses recent chart swings. "
-            "This is more sensitive and may include noise."
+            "Uses recent chart swings. This is more "
+            "sensitive than major market structure."
         ),
     )
 )
@@ -3682,10 +4459,6 @@ show_five_session_sr = (
     st.sidebar.checkbox(
         "Show automatic 5-session S/R",
         value=True,
-        help=(
-            "Uses highs and lows from the five "
-            "completed sessions before the current session."
-        ),
     )
 )
 
@@ -3706,8 +4479,8 @@ show_developing_session_hl = (
 )
 
 st.sidebar.caption(
-    "S/R text is displayed in the right-side "
-    "label rail so it does not cover candles."
+    "All S/R text is placed outside the plotting "
+    "area in the chart's right margin."
 )
 
 
@@ -3810,8 +4583,7 @@ if st.session_state.draw_clicks:
     )
 
 st.sidebar.caption(
-    "Manual drawings are saved in SQLite "
-    "by ticker and survive replay resets."
+    "Manual drawings are saved in SQLite by ticker."
 )
 
 
@@ -3876,9 +4648,8 @@ if st.sidebar.button(
 st.title("💹 Market Replay Simulator")
 
 st.caption(
-    "Session-compressed replay • automatic 5-session S/R • "
-    "right-side S/R label rail • persistent drawings • "
-    "persistent paper account"
+    "Session-compressed replay • major ATR-filtered structure • "
+    "automatic five-session S/R • persistent paper account"
 )
 
 if (
@@ -4020,9 +4791,15 @@ current_chart_matches = (
 )
 
 if current_chart_matches:
-    current_x_index = current_chart_matches[-1]
+    current_x_index = int(
+        chart_dataframe[
+            "x_index"
+        ].iloc[current_chart_matches[-1]]
+    )
 else:
-    current_x_index = len(chart_dataframe) - 1
+    current_x_index = (
+        len(chart_dataframe) - 1
+    )
 
 
 # ============================================================
@@ -4054,7 +4831,9 @@ elif follow_replay:
         end_index = current_x_index
     else:
         start_index = int(
-            current_session_rows["x_index"].iloc[0]
+            current_session_rows[
+                "x_index"
+            ].iloc[0]
         )
 
         end_index = current_x_index
@@ -4083,43 +4862,7 @@ volume_axis_range = get_volume_axis_range(
 
 
 # ============================================================
-# RIGHT-SIDE LABEL RAIL
-# ============================================================
-visible_bar_count = max(
-    1,
-    end_index - start_index + 1,
-)
-
-label_rail_width = int(
-    round(
-        visible_bar_count
-        * LABEL_RAIL_PERCENT
-    )
-)
-
-label_rail_width = max(
-    MIN_LABEL_RAIL_BARS,
-    min(
-        MAX_LABEL_RAIL_BARS,
-        label_rail_width,
-    ),
-)
-
-label_rail_start_x = (
-    end_index + 0.75
-)
-
-label_rail_label_x = (
-    end_index + 2.0
-)
-
-label_rail_end_x = (
-    end_index + label_rail_width
-)
-
-
-# ============================================================
-# AUTOMATIC S/R
+# AUTOMATIC S/R CALCULATIONS
 # ============================================================
 automatic_sr_levels = []
 automatic_sr_sessions = []
@@ -4148,6 +4891,31 @@ if show_developing_session_hl:
             current_session_date,
         )
     )
+
+
+# ============================================================
+# MAJOR STRUCTURE CALCULATION
+# ============================================================
+if show_structure_labels:
+    major_structure = compute_major_structure(
+        calculated_dataframe,
+        active_interval,
+        applied_structure_source,
+        current_timestamp,
+        structure_sensitivity,
+    )
+else:
+    major_structure = {
+        "dataframe": pd.DataFrame(),
+        "swings": [],
+        "events": [],
+        "bias": "NEUTRAL",
+        "status": "OFF",
+        "protected_high": None,
+        "protected_low": None,
+    }
+
+structure_status = major_structure["status"]
 
 
 # ============================================================
@@ -4255,7 +5023,8 @@ position_caption = (
     f"Position ({position_type}): "
     f"{position_text} • "
     f"Cycle {account['cycle_number']} • "
-    f"Session: {active_session_mode}"
+    f"Session: {active_session_mode} • "
+    f"Major structure: {structure_status}"
 )
 
 if position is not None:
@@ -4272,7 +5041,7 @@ if (
     st.warning(
         f"Your open position is on `{position['ticker']}`. "
         f"The current chart is `{active_ticker}`. "
-        "Switch to the position ticker to manage it."
+        "Switch to that ticker to manage it."
     )
 
 
@@ -4361,7 +5130,8 @@ figure.add_trace(
 
 if (
     show_moving_averages
-    and "fast_ma" in chart_dataframe.columns
+    and "fast_ma"
+    in chart_dataframe.columns
 ):
     figure.add_trace(
         go.Scatter(
@@ -4372,7 +5142,7 @@ if (
                 f"{int(fast_length)}"
             ),
             line={
-                "color": C_FAST_EMA,
+                "color": C_FAST_MA,
                 "width": 1.7,
             },
         ),
@@ -4389,7 +5159,7 @@ if (
                 f"{int(slow_length)}"
             ),
             line={
-                "color": C_SLOW_EMA,
+                "color": C_SLOW_MA,
                 "width": 1.7,
             },
         ),
@@ -4399,7 +5169,8 @@ if (
 
 if (
     show_volume_ma
-    and "volume_ma" in chart_dataframe.columns
+    and "volume_ma"
+    in chart_dataframe.columns
 ):
     figure.add_trace(
         go.Scatter(
@@ -4409,7 +5180,7 @@ if (
                 f"VolMA {int(volume_ma_length)}"
             ),
             line={
-                "color": C_VOL_MA,
+                "color": C_VOLUME_MA,
                 "width": 1.7,
             },
         ),
@@ -4419,30 +5190,7 @@ if (
 
 
 # ============================================================
-# RIGHT-SIDE LABEL RAIL BACKGROUND
-# ============================================================
-figure.add_vrect(
-    x0=label_rail_start_x,
-    x1=label_rail_end_x,
-    row=1,
-    col=1,
-    fillcolor="rgba(15,23,42,0.68)",
-    line_width=0,
-    layer="below",
-)
-
-figure.add_vline(
-    x=label_rail_start_x,
-    row=1,
-    col=1,
-    line_color="#64748b",
-    line_width=1,
-    line_dash="dot",
-)
-
-
-# ============================================================
-# CLICK TARGET FOR DRAWING MODE
+# DRAWING CLICK TARGET
 # ============================================================
 if draw_mode != "None":
     figure.add_trace(
@@ -4450,7 +5198,7 @@ if draw_mode != "None":
             x=chart_dataframe["x_index"],
             y=chart_dataframe["close"],
             mode="markers",
-            name="Drawing click targets",
+            name="Drawing targets",
             showlegend=False,
             hoverinfo="skip",
             marker={
@@ -4467,198 +5215,118 @@ if draw_mode != "None":
 
 
 # ============================================================
-# LOCAL STRUCTURE LABELS / LOCAL ZONES
+# MAJOR STRUCTURE LABELS
 # ============================================================
-if (
-    show_structure_labels
-    or show_local_sr_zones
-):
-    structure_dataframe = (
-        chart_dataframe
-        .tail(MAX_STRUCTURE_BARS)
-        .copy()
-        .reset_index(drop=True)
-    )
+if show_structure_labels:
+    display_swings = []
 
-    labeled_swings = raw_swings(
-        structure_dataframe
-    )
+    for swing in major_structure["swings"]:
+        if (
+            suppress_range_swings
+            and swing.get("in_range", False)
+        ):
+            continue
 
-    confirmed_swings = [
-        swing
-        for swing in labeled_swings
-        if swing["i"] + SWING_K
-        <= len(structure_dataframe) - 1
+        x_value = chart_x_for_timestamp(
+            chart_dataframe,
+            swing["timestamp"],
+        )
+
+        if x_value is None:
+            continue
+
+        swing_copy = swing.copy()
+        swing_copy["x_value"] = x_value
+        display_swings.append(swing_copy)
+
+    display_swings = display_swings[
+        -int(maximum_structure_labels):
     ]
 
-else:
-    structure_dataframe = pd.DataFrame()
-    labeled_swings = []
-    confirmed_swings = []
-
-
-if (
-    show_structure_labels
-    and not structure_dataframe.empty
-):
-    bos_events, choch_events = (
-        detect_bos_choch(
-            structure_dataframe,
-            labeled_swings,
-        )
-    )
-
-    for swing in confirmed_swings[
-        -MAX_SWING_LABELS:
-    ]:
-        x_value = structure_dataframe[
-            "x_index"
-        ].iloc[swing["i"]]
-
-        if swing["label"] in {
-            "HH",
-            "HL",
-        }:
+    for swing in display_swings:
+        if swing["label"] in {"HH", "HL"}:
             palette = C_HH
-
-        elif swing["label"] in {
-            "LH",
-            "LL",
-        }:
+        elif swing["label"] in {"LH", "LL"}:
             palette = C_LH
-
         else:
             palette = C_H
 
         y_shift = (
-            18
+            22
             if swing["type"] == "H"
-            else -18
+            else -22
         )
 
-        add_badge(
+        add_structure_badge(
             figure,
-            x_value,
+            swing["x_value"],
             swing["price"],
             swing["label"],
             palette,
             y_shift=y_shift,
         )
 
-    for event in bos_events[
-        -MAX_BOS_LABELS:
-    ]:
-        event_index = event["i"]
+    if show_structure_breaks:
+        visible_events = []
 
-        if (
-            0
-            <= event_index
-            < len(structure_dataframe)
-        ):
-            x_value = (
-                structure_dataframe[
-                    "x_index"
-                ].iloc[event_index]
+        for event in major_structure["events"]:
+            x_value = chart_x_for_timestamp(
+                chart_dataframe,
+                event["timestamp"],
             )
 
-            if event["dir"] == "up":
-                add_badge(
-                    figure,
-                    x_value,
-                    float(
-                        structure_dataframe[
-                            "high"
-                        ].iloc[event_index]
-                    ),
-                    "BOS↑",
-                    C_BOS_UP,
-                    y_shift=22,
-                    arrow=True,
-                )
+            if x_value is None:
+                continue
+
+            event_copy = event.copy()
+            event_copy["x_value"] = x_value
+            visible_events.append(event_copy)
+
+        # Only the latest major events remain visible.
+        visible_events = visible_events[-4:]
+
+        for event in visible_events:
+            if event["type"] == "BOS":
+                if event["dir"] == "up":
+                    text = "BOS↑"
+                    palette = C_BOS_UP
+                    y_shift = 25
+                else:
+                    text = "BOS↓"
+                    palette = C_BOS_DOWN
+                    y_shift = -25
 
             else:
-                add_badge(
-                    figure,
-                    x_value,
-                    float(
-                        structure_dataframe[
-                            "low"
-                        ].iloc[event_index]
-                    ),
-                    "BOS↓",
-                    C_BOS_DN,
-                    y_shift=-22,
-                    arrow=True,
-                )
+                if event["dir"] == "up":
+                    text = "CHoCH↑"
+                    palette = C_CHOCH_UP
+                    y_shift = 25
+                else:
+                    text = "CHoCH↓"
+                    palette = C_CHOCH_DOWN
+                    y_shift = -25
 
-    for event in choch_events[
-        -MAX_CHOCH_LABELS:
-    ]:
-        event_index = event["i"]
-
-        if (
-            0
-            <= event_index
-            < len(structure_dataframe)
-        ):
-            x_value = (
-                structure_dataframe[
-                    "x_index"
-                ].iloc[event_index]
+            add_structure_badge(
+                figure,
+                event["x_value"],
+                event["plot_y"],
+                text,
+                palette,
+                y_shift=y_shift,
+                arrow=True,
             )
 
-            if event["dir"] == "up":
-                add_badge(
-                    figure,
-                    x_value,
-                    float(
-                        structure_dataframe[
-                            "high"
-                        ].iloc[event_index]
-                    ),
-                    "CHoCH↑",
-                    C_CH_UP,
-                    y_shift=22,
-                    arrow=True,
-                )
 
-            else:
-                add_badge(
-                    figure,
-                    x_value,
-                    float(
-                        structure_dataframe[
-                            "low"
-                        ].iloc[event_index]
-                    ),
-                    "CHoCH↓",
-                    C_CH_DN,
-                    y_shift=-22,
-                    arrow=True,
-                )
-
-
-if (
-    show_local_sr_zones
-    and confirmed_swings
-):
-    average_noise = (
-        structure_dataframe["high"]
-        - structure_dataframe["low"]
-    ).tail(20).mean()
-
-    if pd.isna(average_noise):
-        average_noise = 0.0
-
-    average_noise = max(
-        float(average_noise),
-        1e-12,
+# ============================================================
+# LOCAL S/R ZONES
+# ============================================================
+if show_local_sr_zones:
+    local_swings = detect_local_swings(
+        chart_dataframe
     )
 
     local_zones = build_local_zones(
-        confirmed_swings[
-            -MAX_ZONE_SWINGS:
-        ],
+        local_swings[-MAX_LOCAL_ZONE_SWINGS:],
         current_price,
     )
 
@@ -4670,6 +5338,19 @@ if (
         ),
     )[:MAX_LOCAL_ZONES_DRAWN]
 
+    average_noise = (
+        chart_dataframe["high"]
+        - chart_dataframe["low"]
+    ).tail(20).mean()
+
+    if pd.isna(average_noise):
+        average_noise = 0.0
+
+    average_noise = max(
+        float(average_noise),
+        1e-12,
+    )
+
     for zone in local_zones:
         role = local_zone_role(
             zone,
@@ -4678,20 +5359,20 @@ if (
         )
 
         if role == "floor":
-            color = C_FLOOR
-            tag = "LOCAL FLOOR"
+            color = C_LOCAL_FLOOR
+            label = "LOCAL FLOOR"
 
         elif role == "ceiling":
-            color = C_CEIL
-            tag = "LOCAL CEIL"
+            color = C_LOCAL_CEILING
+            label = "LOCAL CEIL"
 
         elif role == "both":
-            color = C_BOTH
-            tag = "LOCAL BOTH"
+            color = C_LOCAL_BOTH
+            label = "LOCAL BOTH"
 
         else:
-            color = C_BROKEN
-            tag = role.replace(
+            color = C_LOCAL_BROKEN
+            label = role.replace(
                 "_",
                 " ",
             ).upper()
@@ -4708,12 +5389,11 @@ if (
             line_dash="dot",
         )
 
-        add_rail_label(
+        add_outer_sr_label(
             figure,
-            label_rail_label_x,
             zone["mid"],
             (
-                f"{tag} "
+                f"{label} "
                 f"{format_price(zone['mid'], False)} "
                 f"({zone['touches']}x)"
             ),
@@ -4722,7 +5402,7 @@ if (
 
 
 # ============================================================
-# AUTOMATIC 5-SESSION S/R
+# AUTOMATIC FIVE-SESSION S/R
 # ============================================================
 for level in automatic_sr_levels:
     level_price = float(
@@ -4734,99 +5414,92 @@ for level in automatic_sr_levels:
         <= current_price
         <= level["zone_high"]
     ):
-        level_role = "PIVOT"
-        level_color = C_AUTO_PIVOT
+        role = "PIVOT"
+        color = C_AUTO_PIVOT
 
     elif level_price < current_price:
-        level_role = "SUP"
-        level_color = C_AUTO_SUPPORT
+        role = "SUP"
+        color = C_AUTO_SUPPORT
 
     else:
-        level_role = "RES"
-        level_color = C_AUTO_RESISTANCE
-
-    line_width = min(
-        1.5 + level["touches"] * 0.5,
-        4.0,
-    )
+        role = "RES"
+        color = C_AUTO_RESISTANCE
 
     figure.add_hline(
         y=level_price,
         row=1,
         col=1,
-        line_color=level_color,
-        line_width=line_width,
+        line_color=color,
+        line_width=min(
+            1.5 + level["touches"] * 0.5,
+            4.0,
+        ),
         line_dash="dash",
     )
 
-    add_rail_label(
+    add_outer_sr_label(
         figure,
-        label_rail_label_x,
         level_price,
         (
-            f"5S {level_role} "
+            f"5S {role} "
             f"{format_price(level_price, False)} "
             f"• {level['touches']} touch"
             f"{'es' if level['touches'] != 1 else ''}"
         ),
-        level_color,
+        color,
     )
 
 
 # ============================================================
-# DEVELOPING CURRENT-SESSION HIGH / LOW
+# DEVELOPING SESSION HIGH / LOW
 # ============================================================
 if developing_session_levels is not None:
-    developing_high = (
+    session_high = float(
         developing_session_levels["high"]
     )
 
-    developing_low = (
+    session_low = float(
         developing_session_levels["low"]
     )
 
     figure.add_hline(
-        y=developing_high,
+        y=session_high,
         row=1,
         col=1,
-        line_color=C_DEVELOPING_HIGH,
+        line_color=C_SESSION_HIGH,
         line_width=1.3,
         line_dash="dot",
     )
 
-    add_rail_label(
+    add_outer_sr_label(
         figure,
-        label_rail_label_x,
-        developing_high,
+        session_high,
         (
             f"SESSION H "
-            f"{format_price(developing_high, False)}"
+            f"{format_price(session_high, False)}"
         ),
-        C_DEVELOPING_HIGH,
+        C_SESSION_HIGH,
         foreground_color="#111111",
     )
 
-    if abs(
-        developing_low - developing_high
-    ) > 1e-12:
+    if abs(session_high - session_low) > 1e-12:
         figure.add_hline(
-            y=developing_low,
+            y=session_low,
             row=1,
             col=1,
-            line_color=C_DEVELOPING_LOW,
+            line_color=C_SESSION_LOW,
             line_width=1.3,
             line_dash="dot",
         )
 
-        add_rail_label(
+        add_outer_sr_label(
             figure,
-            label_rail_label_x,
-            developing_low,
+            session_low,
             (
                 f"SESSION L "
-                f"{format_price(developing_low, False)}"
+                f"{format_price(session_low, False)}"
             ),
-            C_DEVELOPING_LOW,
+            C_SESSION_LOW,
             foreground_color="#111111",
         )
 
@@ -4888,23 +5561,15 @@ marker_styles = {
 }
 
 for marker in st.session_state.markers:
-    marker_ticker = marker.get(
-        "ticker",
-        active_ticker,
-    )
-
-    if marker_ticker != active_ticker:
+    if marker.get("ticker") != active_ticker:
         continue
 
-    marker_matches = (
-        chart_dataframe.index[
-            chart_dataframe["timestamp"]
-            == marker["timestamp"]
-        ]
-        .tolist()
+    x_value = chart_x_for_timestamp(
+        chart_dataframe,
+        marker["timestamp"],
     )
 
-    if not marker_matches:
+    if x_value is None:
         continue
 
     style = marker_styles.get(
@@ -4917,11 +5582,7 @@ for marker in st.session_state.markers:
 
     figure.add_trace(
         go.Scatter(
-            x=[
-                chart_dataframe[
-                    "x_index"
-                ].iloc[marker_matches[-1]]
-            ],
+            x=[x_value],
             y=[marker["price"]],
             mode="markers",
             showlegend=False,
@@ -4941,7 +5602,7 @@ for marker in st.session_state.markers:
 
 
 # ============================================================
-# PERSISTENT MANUAL DRAWINGS
+# PERSISTENT DRAWINGS
 # ============================================================
 persistent_drawings = (
     load_persistent_drawings(
@@ -4968,9 +5629,8 @@ for drawing in persistent_drawings:
             line_width=1.8,
         )
 
-        add_rail_label(
+        add_outer_sr_label(
             figure,
-            label_rail_label_x,
             drawing_price,
             drawing.get(
                 "label",
@@ -5001,39 +5661,17 @@ for drawing in persistent_drawings:
         )
 
     elif drawing["type"] == "trend":
-        first_timestamp = pd.Timestamp(
-            drawing["x0"]
+        first_x = chart_x_for_timestamp(
+            chart_dataframe,
+            drawing["x0"],
         )
 
-        second_timestamp = pd.Timestamp(
-            drawing["x1"]
+        second_x = chart_x_for_timestamp(
+            chart_dataframe,
+            drawing["x1"],
         )
 
-        first_matches = (
-            chart_dataframe.index[
-                chart_dataframe["timestamp"]
-                == first_timestamp
-            ]
-            .tolist()
-        )
-
-        second_matches = (
-            chart_dataframe.index[
-                chart_dataframe["timestamp"]
-                == second_timestamp
-            ]
-            .tolist()
-        )
-
-        if first_matches and second_matches:
-            first_x = chart_dataframe[
-                "x_index"
-            ].iloc[first_matches[-1]]
-
-            second_x = chart_dataframe[
-                "x_index"
-            ].iloc[second_matches[-1]]
-
+        if first_x is not None and second_x is not None:
             figure.add_trace(
                 go.Scatter(
                     x=[
@@ -5062,6 +5700,11 @@ for drawing in persistent_drawings:
 # ============================================================
 # TICKS / CAMERA
 # ============================================================
+visible_bar_count = max(
+    1,
+    end_index - start_index + 1,
+)
+
 number_of_ticks = min(
     12,
     visible_bar_count,
@@ -5130,7 +5773,7 @@ else:
 
 figure.update_layout(
     template="plotly_dark",
-    height=640,
+    height=650,
     dragmode=chart_drag_mode,
     paper_bgcolor="#000000",
     plot_bgcolor="#000000",
@@ -5141,12 +5784,13 @@ figure.update_layout(
         f"{active_ticker} | "
         f"{active_interval} | "
         f"{current_timestamp.strftime('%Y-%m-%d %H:%M')} | "
-        f"{follow_title}"
+        f"{follow_title} | "
+        f"Structure: {structure_status}"
     ),
     margin={
         "l": 10,
-        "r": 25,
-        "t": 75,
+        "r": OUTER_LABEL_MARGIN,
+        "t": 76,
         "b": 10,
     },
     showlegend=True,
@@ -5203,7 +5847,9 @@ figure.update_yaxes(
 if apply_camera:
     x_axis_range = [
         start_index - 0.5,
-        label_rail_end_x + 0.5,
+        end_index
+        + RIGHT_CANDLE_PADDING
+        + 0.5,
     ]
 
     figure.update_xaxes(
@@ -5407,9 +6053,7 @@ with control_column:
             ),
         ]
 
-    for button_label, bars_to_advance in (
-        advance_buttons
-    ):
+    for button_label, bars_to_advance in advance_buttons:
         if st.button(
             button_label,
             width="stretch",
@@ -5430,6 +6074,25 @@ with control_column:
 
     else:
         st.info("FLAT")
+
+    if structure_status == "BULLISH":
+        st.success("Structure: BULLISH")
+
+    elif structure_status == "BEARISH":
+        st.error("Structure: BEARISH")
+
+    elif structure_status == "RANGE":
+        st.warning("Structure: RANGE")
+
+    elif structure_status == "OFF":
+        st.caption("Structure: OFF")
+
+    else:
+        st.info("Structure: NEUTRAL")
+
+    st.caption(
+        f"Source: {applied_structure_source}"
+    )
 
     st.caption(
         f"Session: {current_session_date}"
@@ -5471,7 +6134,7 @@ with st.expander(
 ):
     st.caption(
         "Manual drawings are stored in SQLite by ticker. "
-        "Horizontal-line labels appear in the right-side rail."
+        "Horizontal-line labels appear outside the chart."
     )
 
     if chart_dataframe.empty:
@@ -5985,6 +6648,81 @@ else:
 
 
 # ============================================================
+# MAJOR STRUCTURE DETAILS
+# ============================================================
+with st.expander(
+    "🏗️ Major structure details",
+    expanded=False,
+):
+    structure_dataframe = (
+        major_structure["dataframe"]
+    )
+
+    if not show_structure_labels:
+        st.info(
+            "Major structure labels are disabled."
+        )
+
+    elif structure_dataframe.empty:
+        st.info(
+            "Not enough completed higher-timeframe "
+            "bars are available."
+        )
+
+    else:
+        protected_high = (
+            major_structure["protected_high"]
+        )
+
+        protected_low = (
+            major_structure["protected_low"]
+        )
+
+        protected_high_text = (
+            format_price(
+                protected_high["price"],
+                include_dollar=False,
+            )
+            if protected_high is not None
+            else "None"
+        )
+
+        protected_low_text = (
+            format_price(
+                protected_low["price"],
+                include_dollar=False,
+            )
+            if protected_low is not None
+            else "None"
+        )
+
+        st.markdown(
+            f"""
+| Item | Value |
+|---|---|
+| Structure source | `{applied_structure_source}` |
+| Sensitivity | `{structure_sensitivity}` |
+| Minimum swing move | `{STRUCTURE_SENSITIVITY[structure_sensitivity]:.2f} × ATR` |
+| Break buffer | `{BREAK_ATR_BUFFER:.2f} × ATR` |
+| Minimum breakout body | `{BREAK_BODY_ATR:.2f} × ATR` |
+| Current bias | `{major_structure["bias"]}` |
+| Current status | `{major_structure["status"]}` |
+| Protected high | `{protected_high_text}` |
+| Protected low | `{protected_low_text}` |
+| Significant swings detected | `{len(major_structure["swings"])}` |
+| Major breaks detected | `{len(major_structure["events"])}` |
+"""
+        )
+
+        st.caption(
+            "A higher-timeframe pivot only appears after "
+            "the required candles to its right have closed. "
+            "The label is then placed on the earlier pivot "
+            "without using future replay data."
+        )
+
+
+# ============================================================
 # AUTOMATIC S/R DETAILS
 # ============================================================
 with st.expander(
@@ -6054,12 +6792,6 @@ with st.expander(
             pd.DataFrame(sr_rows),
             hide_index=True,
             width="stretch",
-        )
-
-        st.caption(
-            "Historical levels exclude the current "
-            "partial session. SESSION H and SESSION L "
-            "are calculated separately."
         )
 
 
@@ -6178,23 +6910,24 @@ with st.expander(
 | Visible bars | `{len(visible_dataframe):,}` |
 | Follow mode | `{follow_title}` |
 | Context preset | `{context_preset}` |
-| Position carry | `{"ON" if st.session_state.active_carry_mode else "OFF"}` |
+| Major structure source | `{applied_structure_source}` |
+| Structure status | `{structure_status}` |
 | Five-session S/R | `{"ON" if show_five_session_sr else "OFF"}` |
 | Historical S/R levels | `{len(automatic_sr_levels)}` |
 | Sessions used for S/R | `{completed_sessions_text}` |
-| Developing session H/L | `{"ON" if show_developing_session_hl else "OFF"}` |
 | Persistent drawings | `{len(persistent_drawings)}` |
-| S/R label rail width | `{label_rail_width} bars` |
 | Account cycle | `{account["cycle_number"]}` |
 | SQLite database | `{os.path.abspath(DB_PATH)}` |
 
-### S/R label rail
+### Display behavior
 
-- Horizontal S/R lines remain at their exact prices.
-- `5S SUP / RES / PIVOT` labels are placed in the right rail.
-- `LOCAL FLOOR / CEIL / BOTH / BROKEN` labels are placed in the right rail.
-- `SESSION H / SESSION L` labels are placed in the right rail.
-- Persistent manual horizontal-line labels are placed in the right rail.
-- HH, HL, LH, LL, BOS, and CHoCH remain attached to their relevant candles.
+- S/R labels use `xref="paper"` and sit in the outer right margin.
+- S/R labels do not occupy x-axis bars and cannot cover candles.
+- Major structure uses a higher-timeframe source.
+- Major swings must exceed the selected ATR threshold.
+- BOS and CHoCH require a close beyond a protected level plus an ATR buffer.
+- Swing labels inside detected consolidations are hidden when range suppression is enabled.
+- Only the configured number of recent major swing labels is shown.
+- Structure calculations use revealed replay data only.
 """
     )
